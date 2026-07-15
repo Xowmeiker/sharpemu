@@ -15,8 +15,7 @@ namespace SharpEmu.HLE;
 public static class GuestTlsTemplate
 {
     // Must match CpuDispatcher/DirectExecutionBackend's mapped prefix.
-    private static readonly ulong _startupStaticTlsReservation =
-        OperatingSystem.IsWindows() ? 0x1000UL : 0x10000UL;
+    private const ulong _startupStaticTlsReservation = 0x10000UL;
     private static readonly object _gate = new();
     private static readonly SortedDictionary<ulong, ModuleTemplate> _modules = new();
     private static readonly Dictionary<ulong, ThreadDtv> _threadDtvs = new();

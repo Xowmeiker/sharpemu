@@ -178,8 +178,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private const ulong GuestThreadTlsSize = 0x0001_0000UL;
 
 	// Matches CpuDispatcher.TlsPrefixSize: static TLS blocks sit below the
-	// TCB, and libc.prx already reaches beyond -0x1700 on POSIX.
-	private static readonly ulong GuestThreadTlsPrefixSize = OperatingSystem.IsWindows() ? 0x0000_1000UL : 0x0001_0000UL;
+	// TCB; libc.prx reaches beyond -0x1700 and larger PT_TLS titles exceed
+	// the old 4KB Windows prefix, so map a full 64KB on every host.
+	private const ulong GuestThreadTlsPrefixSize = 0x0001_0000UL;
 
 	private const ulong GuestThreadRegionStride = 0x0100_0000UL;
 
