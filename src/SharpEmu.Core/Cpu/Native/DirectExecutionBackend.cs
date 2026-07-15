@@ -9,6 +9,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu;
+using SharpEmu.Core.Cpu.Native.Linux;
 using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
@@ -859,6 +860,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_activeGuestThreadYieldReason = previousYieldReason;
 	}
 
+	private static IHostFaultHandling CreateDefaultFaultHandling(IHostMemory hostMemory)
+	{
+		if (OperatingSystem.IsWindows())
+		{
+			return new WindowsFaultHandling(hostMemory);
+		}
+
+		return new LinuxFaultHandling(hostMemory);
+	}
+
 	public unsafe DirectExecutionBackend(IModuleManager moduleManager, IHostPlatform? hostPlatform = null, IHostFaultHandling? faultHandling = null)
 	{
 		_moduleManager = moduleManager ?? throw new ArgumentNullException("moduleManager");
@@ -866,7 +877,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_hostThreading = _hostPlatform.Threading;
 		_hostSymbols = _hostPlatform.Symbols;
 		_hostMemory = _hostPlatform.Memory;
-		_faultHandling = faultHandling ?? new WindowsFaultHandling(_hostMemory);
+		_faultHandling = faultHandling ?? CreateDefaultFaultHandling(_hostMemory);
 		_selfHandle = GCHandle.Alloc(this);
 		_selfHandlePtr = GCHandle.ToIntPtr(_selfHandle);
 		_guestTlsBaseTlsIndex = _hostThreading.AllocateTlsSlot();

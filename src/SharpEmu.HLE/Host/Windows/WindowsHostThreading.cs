@@ -106,6 +106,26 @@ internal sealed unsafe partial class WindowsHostThreading : IHostThreading
         }
     }
 
+    public nint CreateNativeEvent()
+    {
+        return CreateEventW(0, false, false, 0);
+    }
+
+    public void SignalNativeEvent(nint eventHandle)
+    {
+        _ = SetEvent(eventHandle);
+    }
+
+    public bool WaitNativeEvent(nint eventHandle, uint timeoutMilliseconds)
+    {
+        return WaitForSingleObject(eventHandle, timeoutMilliseconds) == 0u;
+    }
+
+    public void CloseNativeEvent(nint eventHandle)
+    {
+        _ = CloseHandle(eventHandle);
+    }
+
     private static ulong ReadU64(void* contextRecord, int offset)
     {
         return *(ulong*)((byte*)contextRecord + offset);
@@ -162,4 +182,11 @@ internal sealed unsafe partial class WindowsHostThreading : IHostThreading
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool CloseHandle(nint hObject);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial nint CreateEventW(nint lpEventAttributes, [MarshalAs(UnmanagedType.Bool)] bool bManualReset, [MarshalAs(UnmanagedType.Bool)] bool bInitialState, nint lpName);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetEvent(nint hEvent);
 }

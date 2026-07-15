@@ -172,8 +172,8 @@ public sealed partial class DirectExecutionBackend
 		private static nint _exitThreadAddress;
 
 		private readonly DirectExecutionBackend _backend;
-		private readonly AutoResetEvent _workAvailable = new(false);
-		private readonly AutoResetEvent _workCompleted = new(false);
+		private nint _workAvailable;
+		private nint _workCompleted;
 		private GCHandle _selfHandle;
 		private void* _controlBlock;
 		private void* _loopStub;
@@ -258,8 +258,14 @@ public sealed partial class DirectExecutionBackend
 			var prologuePtr = (nint)(delegate* unmanaged<nint, nint>)&RunPrologue;
 			var epiloguePtr = (nint)(delegate* unmanaged<nint, int, void>)&RunEpilogue;
 			var executorHandle = GCHandle.ToIntPtr(_selfHandle);
-			var workHandle = _workAvailable.SafeWaitHandle.DangerousGetHandle();
-			var doneHandle = _workCompleted.SafeWaitHandle.DangerousGetHandle();
+			_workAvailable = _backend._hostThreading.CreateNativeEvent();
+			_workCompleted = _backend._hostThreading.CreateNativeEvent();
+			if (_workAvailable == 0 || _workCompleted == 0)
+			{
+				return false;
+			}
+			var workHandle = _workAvailable;
+			var doneHandle = _workCompleted;
 
 			byte* code = (byte*)_loopStub;
 			int offset = 0;
@@ -377,8 +383,8 @@ public sealed partial class DirectExecutionBackend
 			_runYieldRequested = false;
 			_runYieldReason = null;
 			_runForcedExit = false;
-			_workAvailable.Set();
-			_workCompleted.WaitOne();
+			_backend._hostThreading.SignalNativeEvent(_workAvailable);
+			_ = _backend._hostThreading.WaitNativeEvent(_workCompleted, uint.MaxValue);
 			_runContext = null;
 			_runState = null;
 			yieldRequested = _runYieldRequested;
@@ -518,12 +524,9 @@ public sealed partial class DirectExecutionBackend
 			{
 				*(int*)_controlBlock = 1;
 			}
-			try
+			if (_workAvailable != 0)
 			{
-				_workAvailable.Set();
-			}
-			catch (ObjectDisposedException)
-			{
+				_backend._hostThreading.SignalNativeEvent(_workAvailable);
 			}
 			var exited = _threadHandle == 0;
 			if (_threadHandle != 0)
@@ -555,8 +558,16 @@ public sealed partial class DirectExecutionBackend
 			{
 				_selfHandle.Free();
 			}
-			_workAvailable.Dispose();
-			_workCompleted.Dispose();
+			if (_workAvailable != 0)
+			{
+				_backend._hostThreading.CloseNativeEvent(_workAvailable);
+				_workAvailable = 0;
+			}
+			if (_workCompleted != 0)
+			{
+				_backend._hostThreading.CloseNativeEvent(_workCompleted);
+				_workCompleted = 0;
+			}
 		}
 	}
 }

@@ -42,4 +42,20 @@ public interface IHostThreading
     /// current thread. Returns false if the thread cannot be opened or suspended.
     /// </summary>
     bool TryCaptureThreadRegisters(uint threadId, out HostCapturedRegisters registers);
+
+    /// <summary>
+    /// Creates an auto-reset event whose handle is valid both for these managed
+    /// methods and for the native wait/set functions the emitters bake in via
+    /// <see cref="HostRuntimeFunction.WaitForSingleObject"/> /
+    /// <see cref="HostRuntimeFunction.SetEvent"/> (a kernel event on Windows, an
+    /// eventfd elsewhere). Returns 0 on failure.
+    /// </summary>
+    nint CreateNativeEvent();
+
+    void SignalNativeEvent(nint eventHandle);
+
+    /// <summary>Waits for the event; true when it was signaled within the timeout.</summary>
+    bool WaitNativeEvent(nint eventHandle, uint timeoutMilliseconds);
+
+    void CloseNativeEvent(nint eventHandle);
 }
