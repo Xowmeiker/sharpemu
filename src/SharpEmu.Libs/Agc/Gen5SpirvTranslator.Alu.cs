@@ -406,6 +406,9 @@ internal static partial class Gen5SpirvTranslator
                     result = EmitSubtractWithBorrow(instruction, reverse: true);
                     break;
                 case "VMulLoU32":
+                // The low 32 bits of a 32x32 multiply are identical for
+                // signed and unsigned operands.
+                case "VMulLoI32":
                 case "VMulU32U24":
                     result = EmitIntegerBinary(instruction, SpirvOp.IMul);
                     break;

@@ -1356,6 +1356,8 @@ internal static partial class Gen5SpirvTranslator
             if (instruction.Opcode is
                 "SNop" or
                 "SWaitcnt" or
+                "SClause" or
+                "SWaitcntDepctr" or
                 "SInstPrefetch" or
                 "STtraceData" or
                 "VInterpMovF32")

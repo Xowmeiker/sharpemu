@@ -754,6 +754,8 @@ internal static class Gen5ShaderTranslator
             0x10 => "SSendmsg",
             0x16 => "STtraceData",
             0x20 => "SInstPrefetch",
+            0x21 => "SClause",
+            0x23 => "SWaitcntDepctr",
             _ => string.Empty,
         };
 
@@ -851,7 +853,7 @@ internal static class Gen5ShaderTranslator
         }
 
         var src0 = word & 0x1FF;
-        sizeDwords = opcode is 0x20 or 0x21 ||
+        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D ||
             src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
         name = opcode switch
@@ -892,7 +894,12 @@ internal static class Gen5ShaderTranslator
             0x28 => "VAddcU32",
             0x29 => "VSubbU32",
             0x2A => "VSubbrevU32",
-            0x2B => "VLdexpF32",
+            // gfx10 fma family: v_fmac_f32 accumulates into the destination
+            // (same dataflow as the VMacF32 emitter); v_fmamk/v_fmaak carry an
+            // implicit literal K and reuse the mad-with-literal decode.
+            0x2B => "VMacF32",
+            0x2C => "VMadMkF32",
+            0x2D => "VMadAkF32",
             0x2F => "VCvtPkrtzF16F32",
             0x30 => "VCvtPkU16U32",
             0x31 => "VCvtPkI16I32",
@@ -1007,6 +1014,7 @@ internal static class Gen5ShaderTranslator
             0x10F => "VMinF32",
             0x110 => "VMaxF32",
             0x11F => "VMacF32",
+            0x12B => "VMacF32",
             0x12F => "VCvtPkrtzF16F32",
             0x141 => "VMadF32",
             0x143 => "VMadU32U24",

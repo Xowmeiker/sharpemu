@@ -159,18 +159,24 @@ var imageBindingType = assembly.GetType("SharpEmu.Libs.Agc.Gen5ImageBinding")
     ?? throw new InvalidOperationException("Gen5ImageBinding not found");
 var globalBindingType = assembly.GetType("SharpEmu.Libs.Agc.Gen5GlobalMemoryBinding")
     ?? throw new InvalidOperationException("Gen5GlobalMemoryBinding not found");
-var pixelOutputBindingType = assembly.GetType("SharpEmu.Libs.Agc.Gen5PixelOutputBinding")
-    ?? throw new InvalidOperationException("Gen5PixelOutputBinding not found");
 var pixelOutputKindType = assembly.GetType("SharpEmu.Libs.Agc.Gen5PixelOutputKind")
     ?? throw new InvalidOperationException("Gen5PixelOutputKind not found");
 var tryCompile = spirvTranslator.GetMethod(
     "TryCompileVertexShader",
     BindingFlags.Public | BindingFlags.Static)
     ?? throw new InvalidOperationException("Gen5SpirvTranslator.TryCompileVertexShader not found");
+// The pixel entry point compiles one host pipeline per guest MRT slot: the
+// export matching pixelRenderTargetSlot is routed to the shader's single
+// color output, so multi-target draws compile the shader once per bound slot.
 var tryCompilePixel = spirvTranslator.GetMethods(BindingFlags.Public | BindingFlags.Static)
-    .Single(method =>
-        method.Name == "TryCompilePixelShader" &&
-        method.GetParameters()[2].ParameterType.IsGenericType);
+    .Single(method => method.Name == "TryCompilePixelShader");
+var pixelRenderTargetSlotIndex = Array.FindIndex(
+    tryCompilePixel.GetParameters(),
+    parameter => parameter.Name == "pixelRenderTargetSlot");
+if (pixelRenderTargetSlotIndex < 0)
+{
+    throw new InvalidOperationException("TryCompilePixelShader.pixelRenderTargetSlot not found");
+}
 var tryCompileCompute = spirvTranslator.GetMethod(
     "TryCompileComputeShader",
     BindingFlags.Public | BindingFlags.Static)
@@ -238,13 +244,16 @@ foreach (var (name, expectTranslate, words) in testPrograms)
     var globalBindings = Array.CreateInstance(globalBindingType, storePcs.Count > 0 ? 1 : 0);
     if (storePcs.Count > 0)
     {
+        var backingStore = new byte[64];
         globalBindings.SetValue(
             Activator.CreateInstance(
                 globalBindingType,
                 8u,
                 0UL,
                 (IReadOnlyList<uint>)storePcs,
-                new byte[64]),
+                backingStore,
+                backingStore.Length,
+                false),
             0);
     }
 
@@ -259,7 +268,6 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         evaluationType,
         new uint[256],
         new uint[256],
-        new Dictionary<uint, IReadOnlyList<uint>>(),
         Array.CreateInstance(imageBindingType, 0),
         globalBindings,
         null,
@@ -298,88 +306,47 @@ foreach (var (name, expectTranslate, words) in testPrograms)
 
     if (name.StartsWith("mrt", StringComparison.Ordinal))
     {
-        (uint GuestSlot, uint HostLocation, string Kind)[] outputSpecs = name switch
+        // One compile per exported guest MRT slot, mirroring how the
+        // presenter builds one pipeline per bound color target.
+        (int GuestSlot, string Kind)[] outputSpecs = name switch
         {
-            "mrt" => new (uint GuestSlot, uint HostLocation, string Kind)[]
+            "mrt" => new (int GuestSlot, string Kind)[]
             {
-                (0, 0, "Float"),
-                (3, 1, "Uint"),
-                (6, 2, "Sint"),
+                (0, "Float"),
+                (3, "Uint"),
+                (6, "Sint"),
             },
-            "mrt-float2" => [(0, 0, "Float"), (1, 1, "Float")],
+            "mrt-float2" => [(0, "Float"), (1, "Float")],
             "mrt8" => Enumerable.Range(0, 8)
-                .Select(index => ((uint)index, (uint)index, "Float"))
+                .Select(index => (index, "Float"))
                 .ToArray(),
-            _ => [(0, 0, "Float")],
+            _ => [(0, "Float")],
         };
-        var pixelOutputs = Array.CreateInstance(pixelOutputBindingType, outputSpecs.Length);
-        for (var index = 0; index < outputSpecs.Length; index++)
+        foreach (var spec in outputSpecs)
         {
-            var spec = outputSpecs[index];
-            pixelOutputs.SetValue(
-                Activator.CreateInstance(
-                    pixelOutputBindingType,
-                    spec.GuestSlot,
-                    spec.HostLocation,
-                    Enum.Parse(pixelOutputKindType, spec.Kind)),
-                index);
-        }
-
-        var pixelArgs = PadWithDefaults(
-            tryCompilePixel,
-            [state, evaluation, pixelOutputs, null, null]);
-        if ((bool)tryCompilePixel.Invoke(
-                null,
-                BindingFlags.OptionalParamBinding,
-                null,
-                pixelArgs,
-                null)!)
-        {
-            var shader = pixelArgs[3]!;
-            var spirv = (byte[])shader.GetType().GetProperty("Spirv")!.GetValue(shader)!;
-            var path = Path.Combine(outputDirectory, $"{name}-ps.spv");
-            File.WriteAllBytes(path, spirv);
-            Console.WriteLine($"[{name}] pixel emit: success, {spirv.Length} bytes -> {path}");
-        }
-        else
-        {
-            failures++;
-            Console.WriteLine($"[{name}] pixel emit: FAILED ({pixelArgs[4]})");
-        }
-
-        if (name == "mrt")
-        {
-            var invalidOutputs = Array.CreateInstance(pixelOutputBindingType, 2);
-            invalidOutputs.SetValue(
-                Activator.CreateInstance(
-                    pixelOutputBindingType,
-                    0u,
-                    0u,
-                    Enum.Parse(pixelOutputKindType, "Float")),
-                0);
-            invalidOutputs.SetValue(
-                Activator.CreateInstance(
-                    pixelOutputBindingType,
-                    3u,
-                    7u,
-                    Enum.Parse(pixelOutputKindType, "Float")),
-                1);
-            var invalidPixelArgs = PadWithDefaults(
+            var pixelArgs = PadWithDefaults(
                 tryCompilePixel,
-                [state, evaluation, invalidOutputs, null, null]);
+                [state, evaluation, Enum.Parse(pixelOutputKindType, spec.Kind), null, null]);
+            pixelArgs[pixelRenderTargetSlotIndex] = spec.GuestSlot;
             if ((bool)tryCompilePixel.Invoke(
                     null,
                     BindingFlags.OptionalParamBinding,
                     null,
-                    invalidPixelArgs,
+                    pixelArgs,
                     null)!)
             {
-                failures++;
-                Console.WriteLine("[mrt] FAILED: sparse host locations were accepted");
+                var shader = pixelArgs[3]!;
+                var spirv = (byte[])shader.GetType().GetProperty("Spirv")!.GetValue(shader)!;
+                var path = Path.Combine(outputDirectory, $"{name}-ps{spec.GuestSlot}.spv");
+                File.WriteAllBytes(path, spirv);
+                Console.WriteLine(
+                    $"[{name}] pixel emit slot {spec.GuestSlot} ({spec.Kind}): success, {spirv.Length} bytes -> {path}");
             }
             else
             {
-                Console.WriteLine($"[mrt] sparse host locations rejected as expected ({invalidPixelArgs[4]})");
+                failures++;
+                Console.WriteLine(
+                    $"[{name}] pixel emit slot {spec.GuestSlot} ({spec.Kind}): FAILED ({pixelArgs[4]})");
             }
         }
     }
