@@ -1530,6 +1530,18 @@ public sealed partial class DirectExecutionBackend
 			return true;
 		}
 
+		// Tier 1b: module export tables are keyed by Orbis NID, not by name, but
+		// dlsym is called with a plain C name (e.g. a game's private
+		// "scriptingGetMem"). Hash the name to its NID and retry the by-NID
+		// indexes so game-private exports resolve the same way system ones do.
+		if (OrbisNid.TryHash(symbolName, out var hashedNid) &&
+			!string.Equals(hashedNid, symbolName, StringComparison.Ordinal) &&
+			(TryResolveRuntimeSymbolAddress(hashedNid, out guestAddress) ||
+				TryFindImportStubGuestAddress(hashedNid, out guestAddress)))
+		{
+			return true;
+		}
+
 		var hasAerolibSymbol = Aerolib.Instance.TryGetByExportName(symbolName, out var hleSymbol);
 		if (hasAerolibSymbol)
 		{
@@ -1796,65 +1808,76 @@ public sealed partial class DirectExecutionBackend
 		regionBase = 0;
 		regionLimit = 0;
 
-		for (var candidateIndex = 0; candidateIndex < 64; candidateIndex++)
+		foreach (var scanBase in ImportStubRegionBases)
 		{
-			var candidateBase = ImportStubRegionCanonicalBase -
-				(ulong)candidateIndex * ImportStubRegionAddressStride;
-			if (!_hostMemory.Query(candidateBase, out var memoryInfo) ||
-				memoryInfo.RegionSize == 0 ||
-				memoryInfo.State != HostRegionState.Committed)
+			for (var candidateIndex = 0; candidateIndex < 64; candidateIndex++)
 			{
-				continue;
-			}
-
-			var candidateLimit = candidateBase + memoryInfo.RegionSize;
-			var hasStub = false;
-			for (var i = 0; i < importEntries.Length; i++)
-			{
-				var entryAddress = importEntries[i].Address;
-				if (entryAddress < candidateBase || entryAddress >= candidateLimit)
+				var candidateBase = scanBase -
+					(ulong)candidateIndex * ImportStubRegionAddressStride;
+				if (!_hostMemory.Query(candidateBase, out var memoryInfo) ||
+					memoryInfo.RegionSize == 0 ||
+					memoryInfo.State != HostRegionState.Committed)
 				{
 					continue;
 				}
 
-				if ((entryAddress - candidateBase) % LazyImportStubSlotSize != 0)
+				var candidateLimit = candidateBase + memoryInfo.RegionSize;
+				var hasStub = false;
+				for (var i = 0; i < importEntries.Length; i++)
+				{
+					var entryAddress = importEntries[i].Address;
+					if (entryAddress < candidateBase || entryAddress >= candidateLimit)
+					{
+						continue;
+					}
+
+					if ((entryAddress - candidateBase) % LazyImportStubSlotSize != 0)
+					{
+						continue;
+					}
+
+					hasStub = true;
+					break;
+				}
+
+				if (!hasStub)
 				{
 					continue;
 				}
 
-				hasStub = true;
-				break;
+				regionBase = candidateBase;
+				regionLimit = candidateLimit;
+				return true;
 			}
-
-			if (!hasStub)
-			{
-				continue;
-			}
-
-			regionBase = candidateBase;
-			regionLimit = candidateLimit;
-			return true;
 		}
 
 		ulong maxStubEnd = 0;
-		for (var i = 0; i < importEntries.Length; i++)
+		foreach (var scanBase in ImportStubRegionBases)
 		{
-			var entryAddress = importEntries[i].Address;
-			if (entryAddress < ImportStubRegionCanonicalBase)
+			for (var i = 0; i < importEntries.Length; i++)
 			{
-				continue;
+				var entryAddress = importEntries[i].Address;
+				if (entryAddress < scanBase)
+				{
+					continue;
+				}
+
+				if ((entryAddress - scanBase) % LazyImportStubSlotSize != 0)
+				{
+					continue;
+				}
+
+				var entryEnd = entryAddress + LazyImportStubSlotSize;
+				if (entryEnd > maxStubEnd)
+				{
+					maxStubEnd = entryEnd;
+					regionBase = scanBase;
+				}
 			}
 
-			if ((entryAddress - ImportStubRegionCanonicalBase) % LazyImportStubSlotSize != 0)
+			if (regionBase != 0)
 			{
-				continue;
-			}
-
-			var entryEnd = entryAddress + LazyImportStubSlotSize;
-			if (entryEnd > maxStubEnd)
-			{
-				maxStubEnd = entryEnd;
-				regionBase = ImportStubRegionCanonicalBase;
+				break;
 			}
 		}
 

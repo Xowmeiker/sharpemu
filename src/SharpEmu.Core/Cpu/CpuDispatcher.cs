@@ -39,6 +39,19 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
     private static readonly ulong BootstrapPayloadBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_E000_0000UL : 0x6FFD_E000_0000UL;
     private static readonly ulong DynlibFallbackStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_D000_0000UL : 0x6FFD_D000_0000UL;
     private static readonly ulong ReturnToHostStubBaseAddress = OperatingSystem.IsWindows() ? 0x7FFD_C000_0000UL : 0x6FFD_C000_0000UL;
+
+    // The canonical bases above sit near the top of a 47-bit x86-64 user VA (~128 TiB).
+    // Hosts with a smaller user VA — notably Android/ARM64 with a 39-bit (512 GiB)
+    // space under Box64 — cannot map there, so each entry-frame region falls back to a
+    // base in a 512-GiB-safe band (~360-384 GiB), clear of the guest image/module
+    // window (<=~36 GiB) and the import-stub fallback (128 GiB). The canonical base is
+    // always tried first, so desktop x86-64 behaviour is unchanged.
+    private const ulong StackFallbackBaseAddress = 0x0000_0060_0000_0000UL;
+    private const ulong TlsFallbackBaseAddress = 0x0000_005F_0000_0000UL;
+    private const ulong BootstrapStubFallbackBaseAddress = 0x0000_005E_0000_0000UL;
+    private const ulong BootstrapPayloadFallbackBaseAddress = 0x0000_005D_0000_0000UL;
+    private const ulong DynlibFallbackStubFallbackBaseAddress = 0x0000_005C_0000_0000UL;
+    private const ulong ReturnToHostStubFallbackBaseAddress = 0x0000_005B_0000_0000UL;
     private const ulong BootstrapRegionSize = 0x0000_1000UL;
     private const ulong ReturnToHostStubStride = 0x0100_0000UL;
     private const ulong BootstrapPayloadResultOffset = 0x28UL;
@@ -325,12 +338,36 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             CpuExitReason.NativeBackendUnavailable);
     }
 
-    private ulong TryMapStackRegion()
+    // Reserve a host-side helper region, trying the canonical (desktop, ~128 TiB)
+    // base first and then a 512-GiB-safe fallback (see the *FallbackBaseAddress
+    // constants). Each base is scanned downward by `stride` for `tries` slots.
+    // Returns the base actually mapped, or 0 if every candidate failed.
+    private static ulong TryReserveEntryRegion(
+        ulong canonicalBase,
+        ulong fallbackBase,
+        ulong stride,
+        int tries,
+        Func<ulong, bool> tryMapAt)
     {
-        const ulong stackStride = 0x0100_0000UL;
-        for (var i = 0; i < 32; i++)
+        Span<ulong> bases = stackalloc ulong[] { canonicalBase, fallbackBase };
+        foreach (var regionBase in bases)
         {
-            var candidateBase = StackBaseAddress - ((ulong)i * stackStride);
+            for (var i = 0; i < tries; i++)
+            {
+                var candidateBase = regionBase - ((ulong)i * stride);
+                if (tryMapAt(candidateBase))
+                {
+                    return candidateBase;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private ulong TryMapStackRegion() =>
+        TryReserveEntryRegion(StackBaseAddress, StackFallbackBaseAddress, 0x0100_0000UL, 32, candidateBase =>
+        {
             try
             {
                 _virtualMemory.Map(
@@ -339,23 +376,17 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     fileData: ReadOnlySpan<byte>.Empty,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
+        });
 
-        return 0;
-    }
-
-    private ulong TryMapTlsRegion()
-    {
-        const ulong tlsStride = 0x0100_0000UL;
-        for (var i = 0; i < 32; i++)
+    private ulong TryMapTlsRegion() =>
+        TryReserveEntryRegion(TlsBaseAddress, TlsFallbackBaseAddress, 0x0100_0000UL, 32, candidateBase =>
         {
-            var candidateBase = TlsBaseAddress - ((ulong)i * tlsStride);
             var mappedBase = candidateBase - TlsPrefixSize;
             try
             {
@@ -365,16 +396,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     fileData: ReadOnlySpan<byte>.Empty,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
-
-        return 0;
-    }
+        });
 
     private static bool InitializeTls(CpuContext context, ulong tlsBase)
     {
@@ -572,10 +600,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         stubData[0] = 0xCC;
         stubData[1] = 0xC3;
 
-        const ulong stride = 0x0100_0000UL;
-        for (var i = 0; i < 16; i++)
+        return TryReserveEntryRegion(BootstrapStubBaseAddress, BootstrapStubFallbackBaseAddress, 0x0100_0000UL, 16, candidateBase =>
         {
-            var candidateBase = BootstrapStubBaseAddress - ((ulong)i * stride);
             try
             {
                 _virtualMemory.Map(
@@ -584,23 +610,19 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     stubData,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
-
-        return 0;
+        });
     }
 
     private ulong TryMapBootstrapPayloadRegion()
     {
-        const ulong stride = 0x0100_0000UL;
-        for (var i = 0; i < 16; i++)
+        return TryReserveEntryRegion(BootstrapPayloadBaseAddress, BootstrapPayloadFallbackBaseAddress, 0x0100_0000UL, 16, candidateBase =>
         {
-            var candidateBase = BootstrapPayloadBaseAddress - ((ulong)i * stride);
             try
             {
                 _virtualMemory.Map(
@@ -609,15 +631,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     ReadOnlySpan<byte>.Empty,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
-
-        return 0;
+        });
     }
 
     private ulong TryMapDynlibFallbackStubRegion()
@@ -627,10 +647,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         stubData[1] = 0xC0;
         stubData[2] = 0xC3;
 
-        const ulong stride = 0x0100_0000UL;
-        for (var i = 0; i < 16; i++)
+        return TryReserveEntryRegion(DynlibFallbackStubBaseAddress, DynlibFallbackStubFallbackBaseAddress, 0x0100_0000UL, 16, candidateBase =>
         {
-            var candidateBase = DynlibFallbackStubBaseAddress - ((ulong)i * stride);
             try
             {
                 _virtualMemory.Map(
@@ -639,15 +657,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     stubData,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
-
-        return 0;
+        });
     }
 
     private ulong TryMapReturnToHostStubRegion()
@@ -656,9 +672,8 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         stubData[0] = 0xF4;
         stubData[1] = 0xCC;
 
-        for (var i = 0; i < 16; i++)
+        return TryReserveEntryRegion(ReturnToHostStubBaseAddress, ReturnToHostStubFallbackBaseAddress, ReturnToHostStubStride, 16, candidateBase =>
         {
-            var candidateBase = ReturnToHostStubBaseAddress - ((ulong)i * ReturnToHostStubStride);
             try
             {
                 _virtualMemory.Map(
@@ -667,15 +682,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                     fileOffset: 0,
                     stubData,
                     ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
-                return candidateBase;
+                return true;
             }
             catch (InvalidOperationException)
             {
-                continue;
+                return false;
             }
-        }
-
-        return 0;
+        });
     }
 
     private bool TryWriteUInt64(ulong address, ulong value)

@@ -173,6 +173,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly ulong GuestThreadTlsBaseAddress =
 		OperatingSystem.IsWindows() ? 0x7FFE_0000_0000UL : 0x6FFE_0000_0000UL;
 
+	// 512-GiB-safe fallbacks for hosts that cannot map the ~112 TiB bases above
+	// (Android/ARM64 39-bit VA under Box64). Each region scans 256*16 MiB = 4 GiB
+	// downward, so the two bands are spaced well clear of each other, of the
+	// CpuDispatcher entry-frame fallbacks (~364-384 GiB), the import-stub fallback
+	// (128 GiB) and the guest image window (<=~36 GiB). Canonical base tried first,
+	// so desktop hosts are unchanged.
+	private const ulong GuestThreadStackFallbackBaseAddress = 0x0000_0058_0000_0000UL;
+
+	private const ulong GuestThreadTlsFallbackBaseAddress = 0x0000_0053_0000_0000UL;
+
 	private const ulong GuestThreadStackSize = 0x0020_0000UL;
 
 	private const ulong GuestThreadTlsSize = 0x0001_0000UL;
@@ -306,6 +316,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	// Keep in sync with SelfLoader import-stub mapping constants.
 	private const ulong ImportStubRegionCanonicalBase = 0x0000_7000_0000_0000UL;
+
+	// Fallback base used on hosts with a small user VA (e.g. Android 39-bit); see
+	// SelfLoader.ImportStubFallbackBaseAddress. Recognition scans both bases.
+	private const ulong ImportStubRegionFallbackBase = 0x0000_0020_0000_0000UL;
+
+	private static readonly ulong[] ImportStubRegionBases =
+		{ ImportStubRegionCanonicalBase, ImportStubRegionFallbackBase };
 
 	private const ulong ImportStubRegionAddressStride = 0x0000_0000_0100_0000UL;
 
@@ -3241,7 +3258,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		else
 		{
-			if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out callbackStackBase, out error))
+			if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackFallbackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out callbackStackBase, out error))
 			{
 				return false;
 			}
@@ -3546,7 +3563,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = "creator context memory is not backed by IVirtualMemory";
 			return false;
 		}
-		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
+		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackFallbackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
 		{
 			return false;
 		}
@@ -3611,32 +3628,37 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static bool TryMapGuestThreadRegion(
 		IVirtualMemory virtualMemory,
 		ulong baseAddress,
+		ulong fallbackBaseAddress,
 		ulong size,
 		ProgramHeaderFlags protection,
 		out ulong mappedBase,
 		out string? error)
 	{
-		for (int i = 0; i < GuestThreadRegionSlotCount; i++)
+		Span<ulong> bases = stackalloc ulong[] { baseAddress, fallbackBaseAddress };
+		foreach (var regionBase in bases)
 		{
-			var candidateBase = baseAddress - ((ulong)i * GuestThreadRegionStride);
-			if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
+			for (int i = 0; i < GuestThreadRegionSlotCount; i++)
 			{
-				continue;
-			}
-			try
-			{
-				virtualMemory.Map(
-					candidateBase,
-					size,
-					fileOffset: 0,
-					fileData: ReadOnlySpan<byte>.Empty,
-					protection: protection);
-				mappedBase = candidateBase;
-				error = null;
-				return true;
-			}
-			catch (InvalidOperationException)
-			{
+				var candidateBase = regionBase - ((ulong)i * GuestThreadRegionStride);
+				if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
+				{
+					continue;
+				}
+				try
+				{
+					virtualMemory.Map(
+						candidateBase,
+						size,
+						fileOffset: 0,
+						fileData: ReadOnlySpan<byte>.Empty,
+						protection: protection);
+					mappedBase = candidateBase;
+					error = null;
+					return true;
+				}
+				catch (InvalidOperationException)
+				{
+				}
 			}
 		}
 
@@ -3650,29 +3672,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong tlsBase,
 		out string? error)
 	{
-		for (int i = 0; i < GuestThreadRegionSlotCount; i++)
+		Span<ulong> bases = stackalloc ulong[] { GuestThreadTlsBaseAddress, GuestThreadTlsFallbackBaseAddress };
+		foreach (var regionBase in bases)
 		{
-			var candidateBase = GuestThreadTlsBaseAddress - ((ulong)i * GuestThreadRegionStride);
-			var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
-			var mappedSize = GuestThreadTlsSize + GuestThreadTlsPrefixSize;
-			if (!IsGuestThreadRegionFree(virtualMemory, mappedBase, mappedSize))
+			for (int i = 0; i < GuestThreadRegionSlotCount; i++)
 			{
-				continue;
-			}
-			try
-			{
-				virtualMemory.Map(
-					mappedBase,
-					mappedSize,
-					fileOffset: 0,
-					fileData: ReadOnlySpan<byte>.Empty,
-					protection: ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
-				tlsBase = candidateBase;
-				error = null;
-				return true;
-			}
-			catch (InvalidOperationException)
-			{
+				var candidateBase = regionBase - ((ulong)i * GuestThreadRegionStride);
+				var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
+				var mappedSize = GuestThreadTlsSize + GuestThreadTlsPrefixSize;
+				if (!IsGuestThreadRegionFree(virtualMemory, mappedBase, mappedSize))
+				{
+					continue;
+				}
+				try
+				{
+					virtualMemory.Map(
+						mappedBase,
+						mappedSize,
+						fileOffset: 0,
+						fileData: ReadOnlySpan<byte>.Empty,
+						protection: ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+					tlsBase = candidateBase;
+					error = null;
+					return true;
+				}
+				catch (InvalidOperationException)
+				{
+				}
 			}
 		}
 

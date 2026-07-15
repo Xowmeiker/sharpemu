@@ -24,6 +24,15 @@ public sealed class SelfLoader : ISelfLoader
     private const ulong SelfSegmentFlag = 0x800;
     private const int PageSize = 0x1000;
     private const ulong ImportStubBaseAddress = 0x0000_7000_0000_0000UL;
+    // Fallback base for hosts whose usable virtual-address space cannot reach the
+    // canonical base — e.g. Android/ARM64 kernels with a 39-bit (512 GiB) user VA,
+    // where a MAP_FIXED at ~112 TiB always fails. 128 GiB fits every realistic host
+    // and stays clear of the guest image/module window (<= ~36 GiB). Tried only
+    // after the canonical base, so desktop x86-64 behaviour is unchanged.
+    // Keep in sync with DirectExecutionBackend.ImportStubRegion{Canonical,Fallback}Base.
+    private const ulong ImportStubFallbackBaseAddress = 0x0000_0020_0000_0000UL;
+    private static readonly ulong[] ImportStubRegionBases =
+        { ImportStubBaseAddress, ImportStubFallbackBaseAddress };
     private const ulong ImportStubAddressStride = 0x0000_0000_0100_0000UL;
     private const ulong ImportStubSlotSize = 0x10;
     private const byte StubTrapOpcode = 0xCC;
@@ -1686,27 +1695,30 @@ public sealed class SelfLoader : ISelfLoader
 
     private static ulong TryMapImportStubRegion(IVirtualMemory virtualMemory, ulong mapSize, ReadOnlySpan<byte> mapData)
     {
-        for (var i = 0; i < 64; i++)
+        foreach (var regionBase in ImportStubRegionBases)
         {
-            var candidateBase = ImportStubBaseAddress - ((ulong)i * ImportStubAddressStride);
-            if (IsAddressRangeMapped(virtualMemory, candidateBase, mapSize))
+            for (var i = 0; i < 64; i++)
             {
-                continue;
-            }
+                var candidateBase = regionBase - ((ulong)i * ImportStubAddressStride);
+                if (IsAddressRangeMapped(virtualMemory, candidateBase, mapSize))
+                {
+                    continue;
+                }
 
-            try
-            {
-                virtualMemory.Map(
-                    candidateBase,
-                    mapSize,
-                    fileOffset: 0,
-                    mapData,
-                    ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
-                return candidateBase;
-            }
-            catch (InvalidOperationException)
-            {
-                continue;
+                try
+                {
+                    virtualMemory.Map(
+                        candidateBase,
+                        mapSize,
+                        fileOffset: 0,
+                        mapData,
+                        ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
+                    return candidateBase;
+                }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
             }
         }
 
