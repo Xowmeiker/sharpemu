@@ -908,7 +908,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private unsafe bool TryReadHostBytes(ulong address, byte[] buffer)
+	internal unsafe bool TryReadHostBytes(ulong address, byte[] buffer)
 	{
 		if (address < 65536)
 		{
