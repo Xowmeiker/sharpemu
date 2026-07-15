@@ -489,6 +489,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public long BlockDeadlineTimestamp { get; set; }
 
+		// Guest signals (sceKernelRaiseException) awaiting cooperative delivery
+		// at this thread's next import dispatch.
+		public readonly ConcurrentQueue<int> PendingSignals = new();
+
 		public long ImportCount;
 
 		public string? LastImportNid;
@@ -3077,6 +3081,42 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return wakeCount;
 	}
 
+	public bool TryRaiseGuestThreadException(ulong threadHandle, int signum)
+	{
+		var wokeTarget = false;
+		using (LockGate("TryRaiseGuestThreadException"))
+		{
+			if (!_guestThreads.TryGetValue(threadHandle, out var thread))
+			{
+				return false;
+			}
+
+			thread.PendingSignals.Enqueue(signum);
+			if (thread.State == GuestThreadRunState.Blocked && thread.HasBlockedContinuation)
+			{
+				// A parked thread never reaches an import dispatch, so wake it
+				// without consulting the wake handler; its blocked wait resumes
+				// with a spurious try-again (SCE waits tolerate that) and the
+				// handler is delivered on the retry's dispatch.
+				thread.State = GuestThreadRunState.Ready;
+				thread.BlockReason = null;
+				thread.BlockDeadlineTimestamp = 0;
+				_readyGuestThreads.Enqueue(thread);
+				Interlocked.Increment(ref _readyGuestThreadCount);
+				wokeTarget = true;
+			}
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] guest_signal.raise signum={signum} target=0x{threadHandle:X16} woke={wokeTarget}");
+		if (wokeTarget && _cpuContext is { } raiseContext)
+		{
+			Pump(raiseContext, "raise_exception");
+		}
+
+		return true;
+	}
+
 	public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads()
 	{
 		using (LockGate("SnapshotThreads"))
@@ -4609,15 +4649,97 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				CallNativeEntry((void*)65534);
 				Console.Error.WriteLine("[LOADER][INFO] Sentinel probe returned.");
 			}
+			// Enroll the inline entry thread in the guest scheduler under the same
+			// pthread handle the guest sees from scePthreadSelf, so kernel HLE can
+			// target it (sceKernelRaiseException) and its untimed waits can park
+			// instead of spinning. On a block it unwinds to the sentinel below and
+			// resumes later on a pump thread like any other guest thread.
+			GuestThreadState? entryThread = null;
+			ulong previousEntryGuestHandle = 0;
+			GuestThreadState? previousEntryState = null;
+			var entryThreadHandle = GuestThreadExecution.CurrentThreadHandleProvider?.Invoke() ?? 0;
+			if (entryThreadHandle != 0)
+			{
+				entryThread = new GuestThreadState
+				{
+					ThreadHandle = entryThreadHandle,
+					EntryPoint = entryPoint,
+					Argument = context[CpuRegister.Rdi],
+					Name = "GuestMain",
+					Priority = 700,
+					AffinityMask = 0,
+					Context = context,
+					State = GuestThreadRunState.Running,
+				};
+				using (LockGate("ExecuteEntry.enroll"))
+				{
+					_guestThreads[entryThreadHandle] = entryThread;
+				}
+				previousEntryGuestHandle = GuestThreadExecution.EnterGuestThread(entryThreadHandle);
+				previousEntryState = _activeGuestThreadState;
+				_activeGuestThreadState = entryThread;
+				Console.Error.WriteLine(
+					$"[LOADER][INFO] Entry thread enrolled as guest thread 0x{entryThreadHandle:X16}");
+			}
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
 			int num6 = -1;
+			var entryGuestRestored = entryThread is null;
 			try
 			{
 				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
+				var entryYielded = false;
+				if (entryThread is not null)
+				{
+					_activeGuestThreadState = previousEntryState;
+					GuestThreadExecution.RestoreGuestThread(previousEntryGuestHandle);
+					entryGuestRestored = true;
+					if (ActiveGuestThreadYieldRequested)
+					{
+						ActiveGuestThreadYieldRequested = false;
+						var entryBlockReason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
+						ActiveGuestThreadYieldReason = null;
+						entryYielded = true;
+						using (LockGate("ExecuteEntry.block"))
+						{
+							entryThread.State = GuestThreadRunState.Blocked;
+							entryThread.BlockReason = entryBlockReason;
+							if (entryThread.HasBlockedContinuation &&
+								entryThread.BlockWaiter is not null &&
+								entryThread.BlockWaiter.TryWake())
+							{
+								entryThread.State = GuestThreadRunState.Ready;
+								entryThread.BlockReason = null;
+								entryThread.BlockDeadlineTimestamp = 0;
+								_readyGuestThreads.Enqueue(entryThread);
+								Interlocked.Increment(ref _readyGuestThreadCount);
+							}
+						}
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] Entry thread parked ({entryBlockReason}); driving scheduler");
+					}
+					else
+					{
+						using (LockGate("ExecuteEntry.exit"))
+						{
+							entryThread.State = GuestThreadRunState.Exited;
+							entryThread.ExitValue = unchecked((ulong)(long)num6);
+						}
+					}
+				}
 				PumpUntilGuestThreadsIdle(context, "entry_return");
+				if (entryYielded && entryThread is not null)
+				{
+					using (LockGate("ExecuteEntry.adopt-exit"))
+					{
+						if (entryThread.State == GuestThreadRunState.Exited)
+						{
+							num6 = unchecked((int)entryThread.ExitValue);
+						}
+					}
+				}
 			}
 			catch (AccessViolationException ex)
 			{
@@ -4633,6 +4755,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine("[LOADER][ERROR] Exception during execution: " + ex2.GetType().Name + ": " + ex2.Message);
 				LastError = "Exception during execution: " + ex2.GetType().Name + ": " + ex2.Message;
 				num6 = -1;
+			}
+			finally
+			{
+				if (!entryGuestRestored)
+				{
+					_activeGuestThreadState = previousEntryState;
+					GuestThreadExecution.RestoreGuestThread(previousEntryGuestHandle);
+				}
 			}
 			if (ActiveForcedGuestExit)
 			{

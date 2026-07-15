@@ -127,11 +127,18 @@
       "sharpemu.hle": {
         "type": "Project",
         "dependencies": {
-          "SharpEmu.Logging": "[1.0.0, )"
+          "SharpEmu.Logging": "[0.0.1, )"
         }
       },
       "sharpemu.logging": {
         "type": "Project"
+      }
+    },
+    "net10.0/linux-x64": {
+      "Ultz.Native.GLFW": {
+        "type": "Transitive",
+        "resolved": "3.4.0",
+        "contentHash": "Iy22JopynbOJ32vA0lBhFEzGi65GQJBuJHYBYRBpydrDpNoTiHnjIXfA65Gu+8qsOr/ZEoIF8r9aHCgAXuO6DA=="
       }
     }
   }

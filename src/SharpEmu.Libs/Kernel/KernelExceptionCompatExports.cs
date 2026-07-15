@@ -40,6 +40,47 @@ public static class KernelExceptionCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    /// <summary>
+    /// Handler installed for a signal, or 0. Consumed by the execution backend
+    /// through <see cref="GuestThreadExecution.ExceptionHandlerResolver"/>.
+    /// </summary>
+    internal static ulong GetInstalledHandler(int signum)
+    {
+        lock (_gate)
+        {
+            return _installedHandlers.TryGetValue(signum, out var handler) ? handler : 0;
+        }
+    }
+
+    [SysAbiExport(
+        Nid = "il03nluKfMk",
+        ExportName = "sceKernelRaiseException",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int RaiseException(CpuContext ctx)
+    {
+        var threadHandle = ctx[CpuRegister.Rdi];
+        var signum = unchecked((int)ctx[CpuRegister.Rsi]);
+
+        if (threadHandle == 0 || !AllowedSignals.Contains(signum))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        // Unity Baselib suspends a thread by raising signal 30 at it and then
+        // waiting on a suspend-ack semaphore that the target's installed
+        // handler posts, so delivery (not just success) matters here.
+        if (GuestThreadExecution.Scheduler?.TryRaiseGuestThreadException(threadHandle, signum) != true)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] sceKernelRaiseException: unknown target thread 0x{threadHandle:X16} signum={signum}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "Qhv5ARAoOEc",
         ExportName = "sceKernelRemoveExceptionHandler",

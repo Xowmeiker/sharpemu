@@ -54,6 +54,15 @@ public interface IGuestThreadScheduler
     int WakeBlockedThreads(string wakeKey, int maxCount = int.MaxValue);
 
     /// <summary>
+    /// Queues a guest exception (sceKernelRaiseException) on a guest thread.
+    /// The installed handler is delivered cooperatively at the target's next
+    /// import dispatch; a parked target is woken (its blocked wait resumes
+    /// with a spurious try-again, which SCE waits tolerate) so delivery can
+    /// happen. Returns false when the thread handle is unknown.
+    /// </summary>
+    bool TryRaiseGuestThreadException(ulong threadHandle, int signum);
+
+    /// <summary>
     /// Applies a new guest scheduling priority to a live thread, mapping it
     /// onto the host thread if one is running. Returns false when the thread
     /// handle is unknown.
@@ -172,6 +181,33 @@ public static class GuestThreadExecution
 
     public static IGuestThreadScheduler? Scheduler { get; set; }
 
+    /// <summary>
+    /// Resolves the current host thread's guest pthread handle, registering one
+    /// lazily when needed. Wired by SharpEmu.Libs at module initialization so
+    /// the execution backend can enroll the inline entry thread in the guest
+    /// scheduler under the same handle the guest observes from scePthreadSelf.
+    /// </summary>
+    public static Func<ulong>? CurrentThreadHandleProvider { get; set; }
+
+    /// <summary>
+    /// Resolves the guest exception handler installed for a signal number
+    /// (0 when none). Wired by SharpEmu.Libs at module initialization.
+    /// </summary>
+    public static Func<int, ulong>? ExceptionHandlerResolver { get; set; }
+
+    [ThreadStatic]
+    private static bool _inGuestSignalHandler;
+
+    /// <summary>
+    /// True while the current thread is executing a guest exception handler
+    /// delivered by the backend (sceKernelRaiseException). Handlers run as a
+    /// nested guest call; parking the thread there would strand the nested
+    /// frame, so blocking HLE waits degrade to their poll paths instead.
+    /// </summary>
+    public static bool InGuestSignalHandler => _inGuestSignalHandler;
+
+    public static void SetInGuestSignalHandler(bool value) => _inGuestSignalHandler = value;
+
     public static bool IsGuestThread => _currentGuestThreadHandle != 0;
 
     public static ulong CurrentGuestThreadHandle => _currentGuestThreadHandle;
@@ -241,7 +277,10 @@ public static class GuestThreadExecution
         IGuestThreadBlockWaiter? waiter = null,
         long blockDeadlineTimestamp = 0)
     {
-        if (!IsGuestThread)
+        // A guest signal handler runs as a nested guest call on top of an
+        // interrupted import frame; parking would capture a continuation into
+        // the nested frame and strand the outer one, so handlers poll instead.
+        if (!IsGuestThread || _inGuestSignalHandler)
         {
             return false;
         }

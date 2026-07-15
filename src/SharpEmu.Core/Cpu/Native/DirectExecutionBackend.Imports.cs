@@ -227,6 +227,12 @@ public sealed partial class DirectExecutionBackend
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
+			if (!activeGuestThreadState.PendingSignals.IsEmpty &&
+				!GuestThreadExecution.InGuestSignalHandler &&
+				activeGuestThreadState.PendingSignals.TryDequeue(out var pendingSignal))
+			{
+				DeliverGuestSignal(cpuContext, pendingSignal, num7, (ulong)argPackPtr + 104uL);
+			}
 		}
 		if (_logStrlenBursts)
 		{
@@ -1102,6 +1108,124 @@ public sealed partial class DirectExecutionBackend
 		Console.Error.WriteLine(
 			$"[LOADER][INFO] Guest entry exit at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={reason} value=0x{value:X16}");
 		return true;
+	}
+
+	// Pooled 2 MiB guest regions used per signal delivery: exception context +
+	// fpstate scratch at the bottom, handler stack above.
+	private static readonly ConcurrentBag<ulong> _signalContextRegions = new();
+
+	private const ulong SignalContextFpStateOffset = 0x1000;
+	private const ulong SignalContextStackOffset = 0x10000;
+
+	// Runs the guest's installed exception handler (sceKernelInstallExceptionHandler)
+	// for a signal queued by sceKernelRaiseException. The handler executes as a
+	// nested guest call on a fresh callback stack; blocking waits inside it poll
+	// (see GuestThreadExecution.InGuestSignalHandler) so it cannot park.
+	private void DeliverGuestSignal(CpuContext cpuContext, int signum, ulong interruptedRip, ulong interruptedRsp)
+	{
+		var handler = GuestThreadExecution.ExceptionHandlerResolver?.Invoke(signum) ?? 0;
+		if (handler == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] guest_signal.drop signum={signum} thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16}: no installed handler");
+			return;
+		}
+
+		if (!TryGetVirtualMemory(cpuContext, out var virtualMemory))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] guest_signal.drop signum={signum}: caller context has no virtual memory");
+			return;
+		}
+
+		if (!_signalContextRegions.TryTake(out var regionBase))
+		{
+			if (!TryMapGuestThreadRegion(
+					virtualMemory,
+					GuestThreadStackBaseAddress,
+					GuestThreadStackFallbackBaseAddress,
+					GuestThreadStackSize,
+					ProgramHeaderFlags.Read | ProgramHeaderFlags.Write,
+					out regionBase,
+					out var regionError))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] guest_signal.drop signum={signum}: {regionError}");
+				return;
+			}
+		}
+
+		WriteSyntheticExceptionContext(cpuContext, regionBase, signum, interruptedRip, interruptedRsp);
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] guest_signal.deliver signum={signum} handler=0x{handler:X16} " +
+			$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} ctx=0x{regionBase:X16}");
+		GuestThreadExecution.SetInGuestSignalHandler(true);
+		try
+		{
+			if (!TryCallGuestFunction(
+					cpuContext,
+					handler,
+					(ulong)signum,
+					regionBase,
+					regionBase + SignalContextStackOffset,
+					GuestThreadStackSize - SignalContextStackOffset,
+					"guest_signal",
+					out var signalError))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] guest_signal.handler-failed signum={signum}: {signalError}");
+			}
+		}
+		finally
+		{
+			GuestThreadExecution.SetInGuestSignalHandler(false);
+			_signalContextRegions.Add(regionBase);
+		}
+	}
+
+	// Synthesizes an exception context for a cooperatively delivered guest
+	// signal. Laid out like a FreeBSD amd64 ucontext (uc_mcontext at +0x10)
+	// with the interrupted thread's register file, since Orbis descends from
+	// FreeBSD; +0xF8 additionally holds a pointer to a zeroed fpstate scratch
+	// block because the observed Baselib suspend handler loads a pointer from
+	// there and passes it on.
+	private static void WriteSyntheticExceptionContext(
+		CpuContext cpuContext,
+		ulong contextBase,
+		int signum,
+		ulong interruptedRip,
+		ulong interruptedRsp)
+	{
+		for (var offset = 0uL; offset < SignalContextFpStateOffset + 0x400uL; offset += 8)
+		{
+			_ = cpuContext.TryWriteUInt64(contextBase + offset, 0);
+		}
+
+		const ulong mc = 0x10;
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x08, cpuContext[CpuRegister.Rdi]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x10, cpuContext[CpuRegister.Rsi]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x18, cpuContext[CpuRegister.Rdx]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x20, cpuContext[CpuRegister.Rcx]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x28, cpuContext[CpuRegister.R8]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x30, cpuContext[CpuRegister.R9]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x38, cpuContext[CpuRegister.Rax]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x40, cpuContext[CpuRegister.Rbx]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x48, cpuContext[CpuRegister.Rbp]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x50, cpuContext[CpuRegister.R10]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x58, cpuContext[CpuRegister.R11]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x60, cpuContext[CpuRegister.R12]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x68, cpuContext[CpuRegister.R13]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x70, cpuContext[CpuRegister.R14]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x78, cpuContext[CpuRegister.R15]);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x88, 0); // mc_addr (fault address)
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xA0, interruptedRip);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xB0, 0x202); // rflags
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xB8, interruptedRsp);
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xC8, 0x320); // mc_len
+		_ = signum;
+
+		// Baselib's signal-30 handler dereferences ctx+0xF8 and forwards it.
+		_ = cpuContext.TryWriteUInt64(contextBase + 0xF8, contextBase + SignalContextFpStateOffset);
 	}
 
 	private unsafe bool TryYieldGuestThreadToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, string reason)

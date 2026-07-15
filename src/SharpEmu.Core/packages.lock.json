@@ -84,13 +84,13 @@
       "sharpemu.hle": {
         "type": "Project",
         "dependencies": {
-          "SharpEmu.Logging": "[1.0.0, )"
+          "SharpEmu.Logging": "[0.0.1, )"
         }
       },
       "sharpemu.libs": {
         "type": "Project",
         "dependencies": {
-          "SharpEmu.HLE": "[1.0.0, )",
+          "SharpEmu.HLE": "[0.0.1, )",
           "Silk.NET.Input": "[2.23.0, )",
           "Silk.NET.Vulkan": "[2.23.0, )",
           "Silk.NET.Vulkan.Extensions.EXT": "[2.23.0, )",
@@ -149,6 +149,13 @@
           "Silk.NET.Windowing.Common": "2.23.0",
           "Silk.NET.Windowing.Glfw": "2.23.0"
         }
+      }
+    },
+    "net10.0/linux-x64": {
+      "Ultz.Native.GLFW": {
+        "type": "Transitive",
+        "resolved": "3.4.0",
+        "contentHash": "Iy22JopynbOJ32vA0lBhFEzGi65GQJBuJHYBYRBpydrDpNoTiHnjIXfA65Gu+8qsOr/ZEoIF8r9aHCgAXuO6DA=="
       }
     }
   }
