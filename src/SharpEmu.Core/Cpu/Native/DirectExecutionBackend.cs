@@ -1768,6 +1768,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// ldmxcsr raises #GP for any set bit outside the low 16 (the observed
+	// intermittent "boot crash" was an emitted stub executing ldmxcsr with a
+	// polluted continuation value, e.g. 0x00102510). All 16 low bits are
+	// architecturally loadable on x86-64, so masking is always safe; an
+	// all-clear value falls back to the SDK default control state.
+	private static uint SanitizeGuestMxcsr(uint value)
+	{
+		value &= 0xFFFFu;
+		return value == 0 ? 0x1F80u : value;
+	}
+
 	private unsafe bool TryPrepareGuestContextTransfer(
 		GuestCpuContinuation target,
 		out nint frameAddress,
@@ -1839,7 +1850,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		frame[14] = target.R13;
 		frame[15] = target.R14;
 		frame[16] = target.R15;
-		frame[17] = target.Mxcsr == 0 ? 0x1F80u : target.Mxcsr;
+		frame[17] = SanitizeGuestMxcsr(target.Mxcsr);
 		frame[18] = target.FpuControlWord == 0 ? 0x037Fu : target.FpuControlWord;
 		frame[19] = target.RestoreFullFpuState ? 1u : 0u;
 		return true;
@@ -1949,7 +1960,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
 	{
-		void* ptr = (void*)_hostMemory.Allocate(0, 256u, HostPageProtection.ReadWriteExecute);
+		void* ptr = (void*)_hostMemory.Allocate(0, 512u, HostPageProtection.ReadWriteExecute);
 		if (ptr == null)
 		{
 			return 0;
@@ -1977,21 +1988,41 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 82;
 			ptr2[num++] = 86;
 			ptr2[num++] = 87;
-			// sub rsp, 0x80  — reserve 8*16 bytes for the SysV variadic XMM save area
-			ptr2[num++] = 0x48; ptr2[num++] = 0x81; ptr2[num++] = 0xEC;
-			ptr2[num++] = 0x80; ptr2[num++] = 0x00; ptr2[num++] = 0x00; ptr2[num++] = 0x00;
-			// movdqu [rsp + i*0x10], xmm{i}  for i = 0..7  (F3 0F 7F /r, SIB=0x24 base=rsp, disp8)
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x44; ptr2[num++] = 0x24; ptr2[num++] = 0x00; // xmm0
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x4C; ptr2[num++] = 0x24; ptr2[num++] = 0x10; // xmm1
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x54; ptr2[num++] = 0x24; ptr2[num++] = 0x20; // xmm2
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x5C; ptr2[num++] = 0x24; ptr2[num++] = 0x30; // xmm3
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x40; // xmm4
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x6C; ptr2[num++] = 0x24; ptr2[num++] = 0x50; // xmm5
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x74; ptr2[num++] = 0x24; ptr2[num++] = 0x60; // xmm6
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x0F; ptr2[num++] = 0x7F; ptr2[num++] = 0x7C; ptr2[num++] = 0x24; ptr2[num++] = 0x70; // xmm7
-			// lea r12, [rsp + 0x80]  — r12 = argpack base (the 12 pushed GP regs), past the XMM area
-			ptr2[num++] = 0x4C; ptr2[num++] = 0x8D; ptr2[num++] = 0xA4; ptr2[num++] = 0x24;
-			ptr2[num++] = 0x80; ptr2[num++] = 0x00; ptr2[num++] = 0x00; ptr2[num++] = 0x00;
+			// Preserve incoming guest RAX/AL and XMM0-XMM7 below the existing
+			// GPR argument pack.  The original pack still begins with RDI and its
+			// return address remains at +0x60.
+			ptr2[num++] = 0x48;
+			ptr2[num++] = 0x81;
+			ptr2[num++] = 0xEC;
+			*(uint*)(ptr2 + num) = 0xB0;
+			num += 4;
+			ptr2[num++] = 0x48;
+			ptr2[num++] = 0x89;
+			ptr2[num++] = 0x04;
+			ptr2[num++] = 0x24;
+			// Preserve the remaining volatile guest machine context before any
+			// host call is made.  libSceFiber's setjmp/longjmp contract includes
+			// R10/R11 and the x87/MXCSR control state.
+			ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x54; ptr2[num++] = 0x24; ptr2[num++] = 0x08; // mov [rsp+8],r10
+			ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x5C; ptr2[num++] = 0x24; ptr2[num++] = 0x10; // mov [rsp+16],r11
+			ptr2[num++] = 0x0F; ptr2[num++] = 0xAE; ptr2[num++] = 0x5C; ptr2[num++] = 0x24; ptr2[num++] = 0x18; // stmxcsr [rsp+24]
+			ptr2[num++] = 0xD9; ptr2[num++] = 0x7C; ptr2[num++] = 0x24; ptr2[num++] = 0x1C; // fnstcw [rsp+28]
+			for (var xmm = 0; xmm < 8; xmm++)
+			{
+				ptr2[num++] = 0xF3;
+				ptr2[num++] = 0x0F;
+				ptr2[num++] = 0x7F;
+				ptr2[num++] = (byte)(0x84 | (xmm << 3));
+				ptr2[num++] = 0x24;
+				*(uint*)(ptr2 + num) = (uint)(0x30 + (xmm * 0x10));
+				num += 4;
+			}
+			ptr2[num++] = 0x4C;
+			ptr2[num++] = 0x8D;
+			ptr2[num++] = 0xA4;
+			ptr2[num++] = 0x24;
+			*(uint*)(ptr2 + num) = 0xB0;
+			num += 4;
 			ptr2[num++] = 72;
 			ptr2[num++] = 131;
 			ptr2[num++] = 236;
@@ -2039,11 +2070,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 131;
 			ptr2[num++] = 196;
 			ptr2[num++] = 40;
-			// movdqu xmm0, [r12 - 0x80]  — reload the return XMM0 the gateway wrote into the
-			// argpack's xmm0 save slot (float/double returns: powf/logf/wcstod). SysV/Win64
-			// XMM regs are volatile across calls, so an unconditional reload is ABI-safe.
-			ptr2[num++] = 0xF3; ptr2[num++] = 0x41; ptr2[num++] = 0x0F; ptr2[num++] = 0x6F;
-			ptr2[num++] = 0x84; ptr2[num++] = 0x24; ptr2[num++] = 0x80; ptr2[num++] = 0xFF; ptr2[num++] = 0xFF; ptr2[num++] = 0xFF;
+			// Materialize SysV vector return registers written by the managed HLE
+			// gateway before restoring the guest stack.
+			for (var xmm = 0; xmm < 2; xmm++)
+			{
+				ptr2[num++] = 0xF3;
+				ptr2[num++] = 0x41;
+				ptr2[num++] = 0x0F;
+				ptr2[num++] = 0x6F;
+				ptr2[num++] = (byte)(0x84 | (xmm << 3));
+				ptr2[num++] = 0x24;
+				*(int*)(ptr2 + num) = -0x80 + (xmm * 0x10);
+				num += 4;
+			}
 			ptr2[num++] = 76;
 			ptr2[num++] = 137;
 			ptr2[num++] = 228;
@@ -2066,14 +2105,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 65;
 			ptr2[num++] = 95;
 			ptr2[num++] = 195;
-		uint num2 = default(uint);
-		if (!_hostMemory.Protect((ulong)ptr, 256u, HostPageProtection.ReadExecute, out num2))
-		{
-			Console.Error.WriteLine($"[LOADER][ERROR] VirtualProtect failed for import dispatch stub at 0x{(nint)ptr:X16}");
-			return 0;
-		}
-		_hostMemory.FlushInstructionCache((ulong)ptr, 256u);
-		return (nint)ptr;
+			Debug.Assert(num <= 512, "Import handler trampoline exceeded its allocation.");
+			if (!_hostMemory.Protect((ulong)ptr, 512u, HostPageProtection.ReadExecute, out _))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Protect failed for import dispatch stub at 0x{(nint)ptr:X16}");
+				return 0;
+			}
+			_hostMemory.FlushInstructionCache((ulong)ptr, 512u);
+			return (nint)ptr;
 		}
 		catch
 		{
@@ -3277,7 +3316,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			FsBase = callerContext.FsBase != 0 ? callerContext.FsBase : (continuation.FsBase != 0 ? continuation.FsBase : fallbackTlsBase),
 			GsBase = callerContext.GsBase != 0 ? callerContext.GsBase : (continuation.GsBase != 0 ? continuation.GsBase : fallbackTlsBase),
 			FpuControlWord = continuation.FpuControlWord == 0 ? (ushort)0x037F : continuation.FpuControlWord,
-			Mxcsr = continuation.Mxcsr == 0 ? 0x1F80u : continuation.Mxcsr,
+			Mxcsr = SanitizeGuestMxcsr(continuation.Mxcsr),
 		};
 
 		context[CpuRegister.Rax] = continuation.Rax;
@@ -3955,7 +3994,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context.FpuControlWord = continuation.FpuControlWord == 0
 			? (ushort)0x037F
 			: continuation.FpuControlWord;
-		context.Mxcsr = continuation.Mxcsr == 0 ? 0x1F80u : continuation.Mxcsr;
+		context.Mxcsr = SanitizeGuestMxcsr(continuation.Mxcsr);
 	}
 
 	private unsafe GuestNativeCallExitReason ExecuteGuestThreadEntry(CpuContext context, ulong entryPoint, string name, out string? reason)
@@ -4226,7 +4265,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// continuation migrates to another managed worker.
 			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08); // sub rsp,8
 			Emit(0xC7); Emit(0x04); Emit(0x24);             // mov dword [rsp],imm32
-			*(uint*)(ptr2 + offset) = context.Mxcsr; offset += sizeof(uint);
+			*(uint*)(ptr2 + offset) = SanitizeGuestMxcsr(context.Mxcsr); offset += sizeof(uint);
 			Emit(0x0F); Emit(0xAE); Emit(0x14); Emit(0x24); // ldmxcsr [rsp]
 			Emit(0x66); Emit(0xC7); Emit(0x04); Emit(0x24); // mov word [rsp],imm16
 			*(ushort*)(ptr2 + offset) = context.FpuControlWord; offset += sizeof(ushort);
