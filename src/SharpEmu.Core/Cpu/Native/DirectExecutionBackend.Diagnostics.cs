@@ -17,6 +17,55 @@ public sealed partial class DirectExecutionBackend
 {
 	private static readonly ConcurrentDictionary<ulong, byte> _knownExecutablePages = new();
 
+	private static readonly bool _perfHleHistogram =
+		string.Equals(System.Environment.GetEnvironmentVariable("SHARPEMU_PERF_HLE"), "1", System.StringComparison.Ordinal);
+	private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _perfHleCounts = new();
+	private static long _perfHleTotal;
+	private static long _perfHleDispatchTicks;
+
+	private static void RecordPerfHleDispatchTime(long ticks)
+	{
+		var total = System.Threading.Interlocked.Add(ref _perfHleDispatchTicks, ticks);
+		var calls = System.Threading.Interlocked.Read(ref _perfHleTotal);
+		if (calls > 0 && calls % 500000 == 0)
+		{
+			var avgUs = (double)total / System.Diagnostics.Stopwatch.Frequency * 1_000_000.0 / calls;
+			System.Console.Error.WriteLine($"[PERF][HLE] managed_dispatch_avg={avgUs:F3}us total_managed_s={(double)total / System.Diagnostics.Stopwatch.Frequency:F2}");
+		}
+	}
+
+	private static readonly bool _perfHleNoDict =
+		string.Equals(System.Environment.GetEnvironmentVariable("SHARPEMU_PERF_HLE_NODICT"), "1", System.StringComparison.Ordinal);
+
+	private static void RecordPerfHleCall(string name)
+	{
+		var total = System.Threading.Interlocked.Increment(ref _perfHleTotal);
+		if (!_perfHleNoDict)
+		{
+			_perfHleCounts.AddOrUpdate(name, 1, static (_, v) => v + 1);
+		}
+
+		if (total % 500000 == 0 && !_perfHleNoDict)
+		{
+			// Snapshot via foreach (a safe moving enumerator) before sorting.
+			// LINQ over a ConcurrentDictionary uses ICollection.CopyTo, which
+			// throws ArgumentException if another thread adds a key between the
+			// Count read and the copy — that exception was being swallowed into
+			// a CPU_TRAP return and crashing the guest.
+			var snapshot = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, long>>(_perfHleCounts.Count + 16);
+			foreach (var kvp in _perfHleCounts)
+			{
+				snapshot.Add(kvp);
+			}
+
+			var top = snapshot
+				.OrderByDescending(kvp => kvp.Value)
+				.Take(20)
+				.Select(kvp => $"{kvp.Key}={kvp.Value}");
+			System.Console.Error.WriteLine($"[PERF][HLE] total={total} top: {string.Join(", ", top)}");
+		}
+	}
+
 	private void RecordRecentImportTrace(
 		long dispatchIndex,
 		string nid,

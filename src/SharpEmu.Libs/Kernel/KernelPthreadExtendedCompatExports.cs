@@ -177,6 +177,70 @@ public static class KernelPthreadExtendedCompatExports
 
     private readonly record struct TlsKeyState(ulong Destructor);
 
+    private const int PthreadDestructorIterations = 4;
+
+    /// <summary>
+    /// POSIX pthread TLS destructor pass: each non-null key value with a
+    /// registered destructor is cleared and the destructor invoked with the
+    /// previous value; repeats up to PTHREAD_DESTRUCTOR_ITERATIONS times so
+    /// destructors that set new thread-local values are themselves cleaned
+    /// up. Called on the exiting guest thread while it is still executable.
+    /// </summary>
+    public static void RunThreadLocalDestructors(CpuContext ctx)
+    {
+        var scheduler = GuestThreadExecution.Scheduler;
+        if (scheduler is null)
+        {
+            return;
+        }
+
+        var threadHandle = KernelPthreadState.GetCurrentThreadHandle();
+        if (!_threadLocalSpecific.TryGetValue(threadHandle, out var values))
+        {
+            return;
+        }
+
+        for (var iteration = 0; iteration < PthreadDestructorIterations; iteration++)
+        {
+            var ranAny = false;
+            foreach (var entry in values)
+            {
+                var value = entry.Value;
+                if (value == 0 ||
+                    !_tlsKeys.TryGetValue(entry.Key, out var keyState) ||
+                    keyState.Destructor == 0)
+                {
+                    continue;
+                }
+
+                // Clear before invoking, per POSIX, so a destructor that
+                // re-sets the key is handled on the next iteration.
+                if (!values.TryUpdate(entry.Key, 0, value))
+                {
+                    continue;
+                }
+
+                ranAny = true;
+                _ = scheduler.TryCallGuestFunction(
+                    ctx,
+                    keyState.Destructor,
+                    value,
+                    0,
+                    0,
+                    0,
+                    "pthread_tls_destructor",
+                    out _);
+            }
+
+            if (!ranAny)
+            {
+                break;
+            }
+        }
+
+        _threadLocalSpecific.TryRemove(threadHandle, out _);
+    }
+
     private readonly record struct PthreadAttrState(
         ulong AffinityMask,
         int DetachState,

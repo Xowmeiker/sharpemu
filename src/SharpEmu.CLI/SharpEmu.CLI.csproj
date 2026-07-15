@@ -8,6 +8,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <ItemGroup>
     <ProjectReference Include="..\SharpEmu.Core\SharpEmu.Core.csproj" />
     <ProjectReference Include="..\SharpEmu.GUI\SharpEmu.GUI.csproj" />
+    <ProjectReference Include="..\SharpEmu.Libs\SharpEmu.Libs.csproj" />
     <ProjectReference Include="..\SharpEmu.Logging\SharpEmu.Logging.csproj" />
   </ItemGroup>
 
@@ -25,7 +26,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <Version>0.0.1</Version>
+    <!-- Workstation GC with background collection keeps pauses short on the
+         guest/render threads; dynamic PGO optimizes the hot HLE dispatch and
+         GPU translation paths. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
   </PropertyGroup>

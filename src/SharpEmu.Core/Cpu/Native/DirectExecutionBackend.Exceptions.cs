@@ -19,6 +19,7 @@ public sealed partial class DirectExecutionBackend
 {
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
+	private static int _guestAllocatorHoleRecoveries;
 
 	private unsafe void SetupExceptionHandler()
 	{
@@ -124,6 +125,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (IsBenignHostDebugException(exceptionCode))
 			{
 				return -1;
@@ -169,6 +175,17 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][INFO]   Exception Address: 0x{exceptionAddress:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RIP: 0x{rip:X16}");
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]   Host thread: managed={Environment.CurrentManagedThreadId} " +
+				$"name='{Thread.CurrentThread.Name ?? "<unnamed>"}'");
+			if (_activeGuestThreadState is { } activeGuestThread)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Guest thread: handle=0x{activeGuestThread.ThreadHandle:X16} " +
+					$"name='{activeGuestThread.Name}' state={activeGuestThread.State} " +
+					$"last_import={activeGuestThread.LastImportNid ?? "<none>"} " +
+					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
+			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   RIP symbol: " + symbol);
@@ -317,6 +334,49 @@ public sealed partial class DirectExecutionBackend
 		{
 			_vectoredHandlerDepth--;
 		}
+	}
+
+	private unsafe static bool TryRecoverGuestAllocatorHole(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_HOLE_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 ||
+			exceptionRecord->ExceptionInformation[1] != 8 ||
+			ReadCtxU64(contextRecord, CTX_RDI) != 0 ||
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		// Demon's Souls occasionally leaves an empty payload in a locked pool
+		// tree node. The allocator dereferences payload+8 before reaching its
+		// existing empty-pool fallback. Match the instruction stream instead of
+		// a title-specific absolute address, then resume at that fallback so the
+		// lock is released and the allocator can try its next backing pool.
+		const ulong allocatorHoleSignature = 0x634CFF568D08778BUL;
+		if (*(ulong*)rip != allocatorHoleSignature || *((byte*)rip + 8) != 0xF2)
+		{
+			return false;
+		}
+
+		const ulong emptyPoolFallbackDelta = 0x8E;
+		WriteCtxU64(contextRecord, CTX_RIP, rip + emptyPoolFallbackDelta);
+		var recovery = Interlocked.Increment(ref _guestAllocatorHoleRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest allocator empty-node adapter recovery #{recovery}: " +
+				$"rip=0x{rip:X16} -> 0x{rip + emptyPoolFallbackDelta:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
 	}
 
 	private static bool IsBenignHostDebugException(uint exceptionCode)

@@ -442,6 +442,7 @@ public static class PadExports
             r2 = Math.Max(r2, pad.RightTrigger);
         }
 
+        buttons |= AutoWalkButtons();
         if (IsAutoCrossActive())
         {
             buttons |= 0x4000;
@@ -462,13 +463,24 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly double AutoCrossRepeatInterval = ParseAutoCrossRepeatInterval();
+    private static readonly double AutoCrossHoldSeconds = ParseAutoCrossHoldSeconds();
+    private static int _autoCrossWasActive;
+    private static readonly bool _logAutoCross = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUTO_CROSS"),
+        "1",
+        StringComparison.Ordinal);
 
     private static double[] ParseAutoCrossTimes()
     {
-        // SHARPEMU_AUTO_CROSS="40,52,64": presses Cross for 0.4s at each
-        // second offset from process start. Debug aid for unattended runs.
+        // SHARPEMU_AUTO_CROSS="40,52,64": presses Cross at each second offset
+        // from process start. SHARPEMU_AUTO_CROSS="repeat" (or "repeat:N")
+        // keeps pressing Cross every N seconds (default 2) so unattended runs
+        // advance through menus into gameplay. SHARPEMU_AUTO_CROSS_HOLD_MS
+        // overrides the press duration (default 400 ms).
         var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS");
-        if (string.IsNullOrWhiteSpace(raw))
+        if (string.IsNullOrWhiteSpace(raw) ||
+            raw.StartsWith("repeat", StringComparison.OrdinalIgnoreCase))
         {
             return [];
         }
@@ -485,24 +497,107 @@ public static class PadExports
         return values.ToArray();
     }
 
-    private static bool IsAutoCrossActive()
+    private static double ParseAutoCrossRepeatInterval()
     {
-        var times = AutoCrossTimes;
-        if (times.Length == 0)
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS");
+        if (string.IsNullOrWhiteSpace(raw) ||
+            !raw.StartsWith("repeat", StringComparison.OrdinalIgnoreCase))
         {
-            return false;
+            return 0;
+        }
+
+        var separator = raw.IndexOf(':');
+        if (separator >= 0 &&
+            double.TryParse(
+                raw[(separator + 1)..],
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var interval) &&
+            interval > 0)
+        {
+            return interval;
+        }
+
+        return 2;
+    }
+
+    private static double ParseAutoCrossHoldSeconds()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_HOLD_MS");
+        if (double.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture, out var holdMs) &&
+            holdMs > 0)
+        {
+            return holdMs / 1000.0;
+        }
+
+        return 0.4;
+    }
+
+    // SHARPEMU_AUTO_WALK=<start-seconds> (or =1 for immediately): hold a
+    // d-pad direction rotating every 2 s (right/down/left/up) from the given
+    // process-start offset, so unattended runs walk through movement
+    // tutorials and wander dungeons for profiling. Delay the start past the
+    // title menu; a wandering d-pad there drives the selection into Settings.
+    private static readonly double _autoWalkStartSeconds = double.TryParse(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_WALK"),
+        System.Globalization.CultureInfo.InvariantCulture,
+        out var autoWalkStart) && autoWalkStart > 0
+            ? (autoWalkStart <= 1 ? 0 : autoWalkStart)
+            : double.NaN;
+
+    private static uint AutoWalkButtons()
+    {
+        if (double.IsNaN(_autoWalkStartSeconds))
+        {
+            return 0;
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (elapsed < _autoWalkStartSeconds)
         {
-            if (elapsed >= time && elapsed < time + 0.4)
+            return 0;
+        }
+
+        return ((long)(elapsed / 2.0) % 4) switch
+        {
+            0 => OrbisPadButton.Right,
+            1 => OrbisPadButton.Down,
+            2 => OrbisPadButton.Left,
+            _ => OrbisPadButton.Up,
+        };
+    }
+
+    private static bool IsAutoCrossActive()
+    {
+        var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
+        bool active;
+        if (AutoCrossRepeatInterval > 0)
+        {
+            // The press must be shorter than the gap so the game observes a
+            // release between presses; otherwise menus treat it as one hold.
+            var hold = Math.Min(AutoCrossHoldSeconds, AutoCrossRepeatInterval * 0.5);
+            active = elapsed % AutoCrossRepeatInterval < hold;
+        }
+        else
+        {
+            active = false;
+            foreach (var time in AutoCrossTimes)
             {
-                return true;
+                if (elapsed >= time && elapsed < time + AutoCrossHoldSeconds)
+                {
+                    active = true;
+                    break;
+                }
             }
         }
 
-        return false;
+        if (_logAutoCross &&
+            Interlocked.Exchange(ref _autoCrossWasActive, active ? 1 : 0) != (active ? 1 : 0) &&
+            active)
+        {
+            Console.Error.WriteLine($"[PAD] auto-cross press at t={elapsed:F1}s");
+        }
+
+        return active;
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>

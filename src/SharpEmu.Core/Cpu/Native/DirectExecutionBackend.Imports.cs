@@ -17,8 +17,22 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	// The native import trampoline keeps the original guest GPR stack layout at
+	// argPackPtr and stores volatile SysV-only state immediately below it.  This
+	// lets the managed gateway observe AL (the variadic vector-argument count)
+	// and all eight vector argument registers without changing the return-slot
+	// offsets used by the guest scheduler.
+	private const int ImportSavedRaxOffset = -176;
+	private const int ImportSavedR10Offset = -168;
+	private const int ImportSavedR11Offset = -160;
+	private const int ImportSavedMxcsrOffset = -152;
+	private const int ImportSavedFpuControlOffset = -148;
+	private const int ImportSavedXmmOffset = -128;
+	private const int ImportVectorRegisterCount = 8;
+
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+	private readonly HashSet<string> _unresolvedImportNids = new(StringComparer.Ordinal);
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -39,6 +53,14 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.WriteLine(
 					$"[LOADER][ERROR] ImportDispatchGatewayManaged: invalid backend handle 0x{backendHandle:X16}");
 				return 18446744071562199042uL;
+			}
+
+			if (_perfHleHistogram)
+			{
+				var startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+				var r = directExecutionBackend.DispatchImport(importIndex, argPackPtr);
+				RecordPerfHleDispatchTime(System.Diagnostics.Stopwatch.GetTimestamp() - startTicks);
+				return r;
 			}
 
 			return directExecutionBackend.DispatchImport(importIndex, argPackPtr);
@@ -139,6 +161,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		cpuContext.Rip = importStubEntry.Address;
+		LoadImportVolatileArguments(cpuContext, argPackPtr);
 		cpuContext[CpuRegister.Rdi] = *(ulong*)argPackPtr;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
 		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
@@ -223,7 +246,7 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
-			ShouldForceGuestExitOnImportLoop(importStubEntry.Nid, num7, num, value, value2) &&
+			ShouldForceGuestExitOnImportLoop(in importStubEntry, num7, num, value, value2) &&
 			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
 		{
 			cpuContext[CpuRegister.Rax] = 1uL;
@@ -448,6 +471,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
+			StoreImportVectorReturn(cpuContext, argPackPtr);
 			if (dispatchResolved &&
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
 				string.Equals(importStubEntry.Nid, "BohYr-F7-is", StringComparison.Ordinal))
@@ -457,9 +481,15 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+				lock (_importResultLogSampleGate)
+				{
+					if (_unresolvedImportNids.Add(importStubEntry.Nid))
+					{
+						Console.Error.WriteLine(
+							$"[COMPAT][ABI] missing_hle nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+							$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+					}
+				}
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
 					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
@@ -482,7 +512,8 @@ public sealed partial class DirectExecutionBackend
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} " +
+						$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} ret=0x{num7:X16}");
 				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
@@ -580,6 +611,36 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private unsafe static void LoadImportVolatileArguments(CpuContext cpuContext, nint argPackPtr)
+	{
+		cpuContext[CpuRegister.Rax] = *(ulong*)(argPackPtr + ImportSavedRaxOffset);
+		cpuContext[CpuRegister.R10] = *(ulong*)(argPackPtr + ImportSavedR10Offset);
+		cpuContext[CpuRegister.R11] = *(ulong*)(argPackPtr + ImportSavedR11Offset);
+		cpuContext.Mxcsr = *(uint*)(argPackPtr + ImportSavedMxcsrOffset);
+		cpuContext.FpuControlWord = *(ushort*)(argPackPtr + ImportSavedFpuControlOffset);
+		for (var registerIndex = 0; registerIndex < ImportVectorRegisterCount; registerIndex++)
+		{
+			var registerAddress = argPackPtr + ImportSavedXmmOffset + (registerIndex * 16);
+			cpuContext.SetXmmRegister(
+				registerIndex,
+				*(ulong*)registerAddress,
+				*(ulong*)(registerAddress + 8));
+		}
+	}
+
+	private unsafe static void StoreImportVectorReturn(CpuContext cpuContext, nint argPackPtr)
+	{
+		// AMD64 returns scalar/vector floating-point values in XMM0 and may use
+		// XMM1 for the second eightbyte of a classified aggregate.
+		for (var registerIndex = 0; registerIndex < 2; registerIndex++)
+		{
+			cpuContext.GetXmmRegister(registerIndex, out var low, out var high);
+			var registerAddress = argPackPtr + ImportSavedXmmOffset + (registerIndex * 16);
+			*(ulong*)registerAddress = low;
+			*(ulong*)(registerAddress + 8) = high;
+		}
+	}
+
 	private unsafe bool TryDispatchLeafImport(
 		CpuContext cpuContext,
 		ImportStubEntry importStubEntry,
@@ -597,6 +658,7 @@ public sealed partial class DirectExecutionBackend
 		var arg0 = *(ulong*)argPackPtr;
 		var returnRip = *(ulong*)(argPackPtr + 96);
 		cpuContext.Rip = importStubEntry.Address;
+		LoadImportVolatileArguments(cpuContext, argPackPtr);
 		cpuContext[CpuRegister.Rdi] = arg0;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
 		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
@@ -656,6 +718,7 @@ public sealed partial class DirectExecutionBackend
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
 		}
+		StoreImportVectorReturn(cpuContext, argPackPtr);
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
 		{
@@ -1068,7 +1131,7 @@ public sealed partial class DirectExecutionBackend
 			ActiveCpuContext.TryWriteUInt64(returnSlotAddress, hostExit);
 	}
 
-	private bool ShouldForceGuestExitOnImportLoop(string nid, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
+	private bool ShouldForceGuestExitOnImportLoop(in ImportStubEntry entry, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
 	{
 		if (dispatchIndex < 1200)
 		{
@@ -1078,18 +1141,18 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (IsImportLoopGuardBoundary(nid))
+		if (entry.IsLoopGuardBoundary)
 		{
 			ResetImportLoopPattern();
 			return false;
 		}
-		if (!_importNidHashCache.TryGetValue(nid, out var value))
-		{
-			value = StableHash64(nid);
-			_importNidHashCache[nid] = value;
-		}
+		var value = entry.NidHash;
 		RecordImportLoopSignature(value, returnRip, BuildImportLoopSignature(value, returnRip, arg0, arg1));
-		if ((dispatchIndex & 0x3F) != 0)
+		// The O(period x repeats) pattern scan is a boot/hang watchdog, not a
+		// steady-state feature; sampling every 256th dispatch keeps its cost
+		// off the hot path while still tripping within a couple of thousand
+		// dispatches of a genuine import loop.
+		if ((dispatchIndex & 0xFF) != 0)
 		{
 			return false;
 		}
@@ -1638,7 +1701,14 @@ public sealed partial class DirectExecutionBackend
 				Array.Copy(previousEntries, newEntries, importIndex);
 			}
 
-			newEntries[importIndex] = new ImportStubEntry(guestAddress, dispatchNid, export);
+			newEntries[importIndex] = new ImportStubEntry(
+				guestAddress,
+				dispatchNid,
+				export,
+				IsLeafImport(dispatchNid),
+				ShouldSuppressStrlenTrace(dispatchNid),
+				IsImportLoopGuardBoundary(dispatchNid),
+				StableHash64(dispatchNid));
 
 			var hostTrampoline = CreateImportHandlerTrampoline(importIndex);
 			if (hostTrampoline == 0 ||

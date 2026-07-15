@@ -13,7 +13,7 @@ using System.Globalization;
 
 namespace SharpEmu.Libs.Kernel;
 
-public static class KernelMemoryCompatExports
+public static partial class KernelMemoryCompatExports
 {
     private const int MaxGuestStringLength = 4096;
     private const int WideCharSize = sizeof(ushort);
@@ -137,6 +137,29 @@ public static class KernelMemoryCompatExports
     private static ulong _threadAtexitCountCallback;
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
+
+    /// <summary>
+    /// Invokes the guest's registered thread-dtors callback (set through
+    /// _sceKernelRtldSetThreadDtors) on the exiting thread.
+    /// </summary>
+    public static void RunThreadDtors(CpuContext ctx)
+    {
+        var callback = _threadDtorsCallback;
+        if (callback == 0)
+        {
+            return;
+        }
+
+        _ = GuestThreadExecution.Scheduler?.TryCallGuestFunction(
+            ctx,
+            callback,
+            0,
+            0,
+            0,
+            0,
+            "kernel_thread_dtors",
+            out _);
+    }
     private static int _nullMemsetRecoveryCount;
     private static int _nonCanonicalMemsetRecoveryCount;
     private static int _inaccessibleMemsetRecoveryCount;

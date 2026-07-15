@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
-using SharpEmu.HLE.Host;
-using SharpEmu.Libs.Audio;
 using SharpEmu.Libs.Kernel;
-using SharpEmu.Logging;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
@@ -42,97 +39,55 @@ public static class VideoOutExports
     private const ulong SceVideoOutPixelFormatA2R10G10B10 = 0x88060000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Srgb = 0x88000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Bt2020Pq = 0x88740000;
-    private const ulong SceVideoOutInternalEventVblank = 0x5;
     private const ulong SceVideoOutInternalEventFlip = 0x6;
+    // Distinct internal ident for vblank events. Games interpret events through
+    // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
+    // its distinctness from the flip ident matters for GetEventId/GetEventData.
+    private const ulong SceVideoOutInternalEventVblank = 0x40;
     private const short OrbisKernelEventFilterVideoOut = -13;
 
     private static readonly object _stateGate = new();
     private static readonly object _frameDumpGate = new();
     private static readonly Dictionary<int, VideoOutPortState> _ports = new();
+    private static readonly Dictionary<(int Handle, int BufferIndex, ulong Address), ulong> _lastFrameFingerprints = new();
+    private static int _nextHandle = 1;
+    private static int _frameDumpCount;
+    private static long _nextFrameDumpIndex;
+    private static string _windowTitle = "SharpEmu VideoOut";
+    private static readonly bool _logFrameRate = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT_FPS"),
+        "1",
+        StringComparison.Ordinal);
+    private static long _frameRateWindowStart = Stopwatch.GetTimestamp();
+    private static long _submittedFrameCount;
+    private static long _presentedFrameCount;
 
-    // Hardware raises vblank autonomously; UE blocks its frame loop on it.
-    private const double VblankHz = 60.0;
-    private const int VblankWaitTimeoutMilliseconds = 100;
-    private static Thread? _vblankPumpThread;
-    private static int _vblankPumpStarted;
-    private static volatile int _vblankPumpStopRequested;
-    private static volatile int _presentationWindowCloseNotified;
+    private static int _hostInterruptNotified;
 
-    private static readonly object _vblankEdgeGate = new();
-    private static ulong _vblankEdgeSequence;
-    private static long _vblankMissedEdges;
-
-    private static void EnsureVblankPumpStarted()
-    {
-        if (Interlocked.Exchange(ref _vblankPumpStarted, 1) != 0)
-        {
-            return;
-        }
-
-        HostPlatform.Current.Threading.RequestTimerResolution();
-
-        _vblankPumpThread = new Thread(VblankPumpLoop)
-        {
-            IsBackground = true,
-            Name = "SharpEmu VideoOut vblank",
-            Priority = ThreadPriority.AboveNormal,
-        };
-        _vblankPumpThread.Start();
-    }
-
-    private static void VblankPumpLoop()
-    {
-        var intervalTicks = Math.Max(1L, (long)(Stopwatch.Frequency / VblankHz));
-        var nextEdge = Stopwatch.GetTimestamp() + intervalTicks;
-
-        while (_vblankPumpStopRequested == 0)
-        {
-            WaitUntilTimestamp(nextEdge);
-            PumpVblanks();
-
-            nextEdge += intervalTicks;
-
-            var now = Stopwatch.GetTimestamp();
-            if (nextEdge < now)
-            {
-                var missed = (now - nextEdge) / intervalTicks + 1;
-                Interlocked.Add(ref _vblankMissedEdges, missed);
-                nextEdge = now + intervalTicks;
-            }
-        }
-    }
-
-    public static void NotifyPresentationWindowClosed()
-    {
-        if (Interlocked.Exchange(ref _presentationWindowCloseNotified, 1) != 0)
-        {
-            return;
-        }
-
-        Console.Error.WriteLine("[LOADER][INFO] VideoOut presentation window closed");
-        RequestHostShutdown("videoout-window-closed");
-    }
-
+    /// <summary>
+    /// Host-side interrupt (Ctrl-C): request the same cooperative shutdown the
+    /// CPU backend performs when the presentation window closes, so guest
+    /// worker threads unwind before executable stubs are freed.
+    /// </summary>
     public static void NotifyHostInterrupt()
     {
-        if (Interlocked.Exchange(ref _presentationWindowCloseNotified, 1) != 0)
+        if (Interlocked.Exchange(ref _hostInterruptNotified, 1) != 0)
         {
             return;
         }
 
         Console.Error.WriteLine("[LOADER][INFO] Host interrupt requested");
-        RequestHostShutdown("host-interrupt");
-    }
-
-    private static void RequestHostShutdown(string reason)
-    {
-        AudioOutExports.ShutdownAllPorts();
-        StopVblankPump();
-        HostSessionControl.RequestShutdown(reason);
+        SharpEmu.HLE.HostSessionControl.RequestShutdown("host-interrupt");
         ScheduleProcessExitIfGuestDoesNotStop();
     }
 
-    private static void ScheduleProcessExitIfGuestDoesNotStop()
+    /// <summary>
+    /// A wedged guest thread can ignore the cooperative shutdown request
+    /// forever (the stall watchdog deliberately keeps the process alive for
+    /// recovery); once the user has closed the window or hit Ctrl-C there is
+    /// nothing left to recover for, so force the exit.
+    /// </summary>
+    internal static void ScheduleProcessExitIfGuestDoesNotStop()
     {
         ThreadPool.QueueUserWorkItem(static _ =>
         {
@@ -141,115 +96,7 @@ public static class VideoOutExports
         });
     }
 
-    public static void StopVblankPump()
-    {
-        if (Interlocked.Exchange(ref _vblankPumpStopRequested, 1) != 0)
-        {
-            return;
-        }
-
-        var thread = _vblankPumpThread;
-        if (thread is { IsAlive: true })
-        {
-            thread.Join(TimeSpan.FromSeconds(2));
-        }
-    }
-
-    private static void WaitUntilTimestamp(long deadlineTicks)
-    {
-        var spinThresholdTicks = Stopwatch.Frequency * 2L / 1000L;
-
-        while (true)
-        {
-            var remaining = deadlineTicks - Stopwatch.GetTimestamp();
-            if (remaining <= 0)
-            {
-                return;
-            }
-
-            if (remaining > spinThresholdTicks)
-            {
-                var sleepMilliseconds =
-                    (int)((remaining - spinThresholdTicks) * 1000L / Stopwatch.Frequency);
-                if (sleepMilliseconds > 0)
-                {
-                    Thread.Sleep(sleepMilliseconds);
-                    continue;
-                }
-            }
-
-            Thread.SpinWait(64);
-        }
-    }
-
-    // Only ever touched by the vblank pump thread; reused across edges so the 60 Hz
-    // pump does not allocate a fresh snapshot per edge.
-    private static readonly List<VideoOutPortState> _vblankPumpPorts = new();
-
-    private static void PumpVblanks()
-    {
-        lock (_vblankEdgeGate)
-        {
-            _vblankEdgeSequence++;
-            Monitor.PulseAll(_vblankEdgeGate);
-        }
-
-        _vblankPumpPorts.Clear();
-        lock (_stateGate)
-        {
-            if (_ports.Count == 0)
-            {
-                return;
-            }
-
-            // Signalling reaches WakeBlockedThreads -> Pump(), which serialises on one global
-            // flag. Waking an unwatched queue would hold it 60x/sec and starve guest threads.
-            foreach (var port in _ports.Values)
-            {
-                if (port.VblankEvents.Count != 0)
-                {
-                    _vblankPumpPorts.Add(port);
-                }
-            }
-        }
-
-        foreach (var port in _vblankPumpPorts)
-        {
-            SignalVblank(port);
-        }
-    }
-
-    private static readonly Dictionary<(int Handle, int BufferIndex, ulong Address), ulong> _lastFrameFingerprints = new();
-    private static int _nextHandle = 1;
-    private static int _frameDumpCount;
-    private static long _nextFrameDumpIndex;
-    private static string _windowTitleBase = "SharpEmu VideoOut";
-    private static string _windowTitle = "SharpEmu VideoOut";
-    private static readonly bool _logFrameRate = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT_FPS"),
-        "1",
-        StringComparison.Ordinal);
-    private static readonly bool _logVideoOutSync = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT_SYNC"),
-        "1",
-        StringComparison.Ordinal);
-    // Call sites must check this before building the interpolated message; the trace
-    // strings would otherwise be allocated on the per-frame flip path even with tracing off.
-    private static readonly bool _logVideoOut = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),
-        "1",
-        StringComparison.Ordinal);
-    private static readonly bool _dumpVideoOut = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_VIDEOOUT"),
-        "1",
-        StringComparison.Ordinal);
-    private static long _frameRateWindowStart = Stopwatch.GetTimestamp();
-    private static long _submittedFrameCount;
-    private static long _presentedFrameCount;
-    private static long _vblankSignalCount;
-    private static long _flipSubmitCount;
-
-    public static void ConfigureApplicationInfo(string? title, string? titleId, string? version, string? emulatorCommitSha)
+    public static void ConfigureApplicationInfo(string? title, string? titleId, string? version, string? commitSha = null)
     {
         var parts = new List<string>();
         if (!string.IsNullOrWhiteSpace(title))
@@ -262,27 +109,16 @@ public static class VideoOutExports
             parts.Add($"[{titleId.Trim()}]");
         }
 
+        if (!string.IsNullOrWhiteSpace(commitSha))
+        {
+            parts.Add($"({commitSha.Trim()})");
+        }
+
         var application = parts.Count == 0 ? "VideoOut" : string.Join(' ', parts);
         var versionSuffix = string.IsNullOrWhiteSpace(version) ? string.Empty : $" v{version.Trim()}";
-        var commitSuffix = string.IsNullOrWhiteSpace(emulatorCommitSha) ? string.Empty : $" \u00b7 {emulatorCommitSha.Trim()}";
-        var hardwareSuffix = $" \u00b7 {HostSystemInfo.CpuName}";
         lock (_stateGate)
         {
-            _windowTitleBase = $"SharpEmu{commitSuffix} - {application}{versionSuffix}{hardwareSuffix}";
-            _windowTitle = $"{_windowTitleBase} \u00b7 {HostSystemInfo.GpuName}";
-        }
-    }
-
-    internal static void SetSelectedGpuName(string gpuName)
-    {
-        if (string.IsNullOrWhiteSpace(gpuName))
-        {
-            return;
-        }
-
-        lock (_stateGate)
-        {
-            _windowTitle = $"{_windowTitleBase} \u00b7 {gpuName.Trim()}";
+            _windowTitle = $"SharpEmu - {application}{versionSuffix}";
         }
     }
 
@@ -307,8 +143,9 @@ public static class VideoOutExports
         public float Gamma { get; set; } = 1.0f;
         public VideoOutBufferGroup?[] Groups { get; } = new VideoOutBufferGroup?[MaxDisplayBufferGroups];
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
-        public List<FlipEventRegistration> VblankEvents { get; } = new();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
+        public List<FlipEventRegistration> VblankEvents { get; } = new();
+        public long LastVblankTimestamp;
     }
 
     private sealed class VideoOutBufferGroup
@@ -377,7 +214,6 @@ public static class VideoOutExports
             {
                 Handle = handle,
             };
-            EnsureVblankPumpStarted();
             return handle;
         }
     }
@@ -418,34 +254,6 @@ public static class VideoOutExports
         }
 
         port.FlipRate = rate;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    [SysAbiExport(
-        Nid = "+I4K03i3EL0",
-        ExportName = "sceVideoOutInitializeOutputOptions",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceVideoOut")]
-    public static int VideoOutInitializeOutputOptions(CpuContext ctx)
-    {
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    [SysAbiExport(
-        Nid = "w0hLuNarQxY",
-        ExportName = "sceVideoOutConfigureOutput",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceVideoOut")]
-    public static int VideoOutConfigureOutput(CpuContext ctx)
-    {
-        // Accept the requested output configuration; the presenter always renders
-        // at the display buffer's native size.
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        if (!TryGetPort(handle, out _))
-        {
-            return OrbisVideoOutErrorInvalidHandle;
-        }
-
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -549,65 +357,29 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidHandle;
         }
 
-        EnsureVblankPumpStarted();
-
-        lock (_vblankEdgeGate)
+        // Wait to the next boundary of the emulated display refresh rather
+        // than a raw Thread.Sleep(1): coarse sleeps overshoot to the
+        // scheduler quantum, which mis-paces games that spin on vblank. A
+        // caller that arrives past the boundary already missed the vblank:
+        // report it immediately instead of charging a full extra interval.
+        var intervalTicks = Stopwatch.Frequency / Math.Max(1, (long)port.RefreshRate);
+        var now = Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref port.LastVblankTimestamp);
+        var target = last + intervalTicks;
+        if (target <= now || target > now + intervalTicks)
         {
-            var entryEdge = _vblankEdgeSequence;
-            while (_vblankEdgeSequence == entryEdge)
-            {
-                if (!Monitor.Wait(_vblankEdgeGate, VblankWaitTimeoutMilliseconds))
-                {
-                    break;
-                }
-            }
+            Interlocked.CompareExchange(ref port.LastVblankTimestamp, now, last);
         }
-
-        SignalVblank(port);
-
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    [SysAbiExport(
-        Nid = "Xru92wHJRmg",
-        ExportName = "sceVideoOutAddVblankEvent",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceVideoOut")]
-    public static int VideoOutAddVblankEvent(CpuContext ctx)
-    {
-        var equeue = ctx[CpuRegister.Rdi];
-        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
-        if (!TryGetPort(handle, out var port))
+        else
         {
-            return OrbisVideoOutErrorInvalidHandle;
+            HostTiming.SleepUntil(target);
+            Interlocked.CompareExchange(ref port.LastVblankTimestamp, target, last);
         }
-
-        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
-        {
-            return OrbisVideoOutErrorInvalidEventQueue;
-        }
-
-        var userData = ctx[CpuRegister.Rdx];
         lock (_stateGate)
         {
-            var existingIndex = port.VblankEvents.FindIndex(registration => registration.Equeue == equeue);
-            if (existingIndex >= 0)
-            {
-                port.VblankEvents[existingIndex] = new FlipEventRegistration(equeue, userData);
-            }
-            else
-            {
-                port.VblankEvents.Add(new FlipEventRegistration(equeue, userData));
-            }
+            port.VblankCount++;
         }
 
-        // Some engines wait on this queue before issuing their first flip. Provide a first
-        // edge now; later calls to WaitVblank advance the same notification sequence.
-        SignalVblank(port);
-        if (_logVideoOut)
-        {
-            TraceVideoOut($"videoout.add_vblank_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
-        }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -652,6 +424,69 @@ public static class VideoOutExports
     }
 
     [SysAbiExport(
+        Nid = "Xru92wHJRmg",
+        ExportName = "sceVideoOutAddVblankEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAddVblankEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        var userData = ctx[CpuRegister.Rdx];
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
+        {
+            return OrbisVideoOutErrorInvalidEventQueue;
+        }
+
+        lock (_stateGate)
+        {
+            var existingIndex = port.VblankEvents.FindIndex(registration => registration.Equeue == equeue);
+            if (existingIndex >= 0)
+            {
+                port.VblankEvents[existingIndex] = new FlipEventRegistration(equeue, userData);
+            }
+            else
+            {
+                port.VblankEvents.Add(new FlipEventRegistration(equeue, userData));
+            }
+        }
+
+        // A guest that parks its main/render loop on a vblank event needs a
+        // steady tick to advance; start the emulated vblank cadence on demand.
+        StartVblankThreadOnce();
+        TraceVideoOut($"videoout.add_vblank_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "oNOQn3knW6s",
+        ExportName = "sceVideoOutDeleteVblankEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutDeleteVblankEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        lock (_stateGate)
+        {
+            port.VblankEvents.RemoveAll(registration => registration.Equeue == equeue);
+        }
+
+        TraceVideoOut($"videoout.delete_vblank_event eq=0x{equeue:X16} handle={handle}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "U46NwOiJpys",
         ExportName = "sceVideoOutSubmitFlip",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -663,56 +498,6 @@ public static class VideoOutExports
         var flipMode = unchecked((int)ctx[CpuRegister.Rdx]);
         var flipArg = unchecked((long)ctx[CpuRegister.Rcx]);
         return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: true);
-    }
-
-    // Struct layout matches the classic SceVideoOutFlipStatus (40 bytes):
-    // count, processTime, tsc, flipArg, currentBuffer, flipPendingNum.
-    [SysAbiExport(
-        Nid = "SbU3dwp80lQ",
-        ExportName = "sceVideoOutGetFlipStatus",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceVideoOut")]
-    public static int VideoOutGetFlipStatus(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var statusAddress = ctx[CpuRegister.Rsi];
-        if (statusAddress == 0)
-        {
-            return OrbisVideoOutErrorInvalidAddress;
-        }
-
-        VideoOutPortState? port;
-        lock (_stateGate)
-        {
-            _ports.TryGetValue(handle, out port);
-        }
-
-        if (port is null)
-        {
-            return OrbisVideoOutErrorInvalidHandle;
-        }
-
-        ulong count;
-        long flipArg;
-        uint currentBuffer;
-        lock (_stateGate)
-        {
-            count = port.FlipCount;
-            flipArg = 0;
-            currentBuffer = unchecked((uint)port.CurrentBuffer);
-        }
-
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, unchecked((ulong)flipArg));
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
-
-        if (_logVideoOut)
-        {
-            TraceVideoOut($"videoout.get_flip_status handle={handle} count={count} currentBuffer={currentBuffer}");
-        }
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -751,13 +536,23 @@ public static class VideoOutExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (filter != OrbisKernelEventFilterVideoOut ||
-            ident is not (SceVideoOutInternalEventVblank or SceVideoOutInternalEventFlip))
+        if (filter != OrbisKernelEventFilterVideoOut)
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
 
-        return 0;
+        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank.
+        if (ident == SceVideoOutInternalEventFlip)
+        {
+            return 0;
+        }
+
+        if (ident == SceVideoOutInternalEventVblank)
+        {
+            return 1;
+        }
+
+        return OrbisVideoOutErrorInvalidEvent;
     }
 
     [SysAbiExport(
@@ -782,7 +577,7 @@ public static class VideoOutExports
         }
 
         if (filter != OrbisKernelEventFilterVideoOut ||
-            ident is not (SceVideoOutInternalEventVblank or SceVideoOutInternalEventFlip))
+            (ident != SceVideoOutInternalEventFlip && ident != SceVideoOutInternalEventVblank))
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
@@ -1102,58 +897,6 @@ public static class VideoOutExports
         return groupIndex < 0 ? groupIndex : setIndex;
     }
 
-    private static void SignalVblank(VideoOutPortState port)
-    {
-        // Snapshot the registrations into a pooled rental so the triggers can run outside
-        // _stateGate without copying the list into a fresh allocation on every edge.
-        // A per-port reusable buffer would race: the pump thread and a guest thread's
-        // first-edge signal (AddVblankEvent) can signal the same port concurrently.
-        FlipEventRegistration[]? vblankEvents = null;
-        int vblankEventCount;
-        ulong eventHint;
-        lock (_stateGate)
-        {
-            port.VblankCount++;
-            eventHint = SceVideoOutInternalEventVblank |
-                ((port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16);
-            vblankEventCount = port.VblankEvents.Count;
-            if (vblankEventCount != 0)
-            {
-                vblankEvents = ArrayPool<FlipEventRegistration>.Shared.Rent(vblankEventCount);
-                port.VblankEvents.CopyTo(vblankEvents);
-            }
-        }
-
-        var signalCount = Interlocked.Increment(ref _vblankSignalCount);
-
-        if (vblankEvents is not null)
-        {
-            try
-            {
-                for (var i = 0; i < vblankEventCount; i++)
-                {
-                    _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
-                        vblankEvents[i].Equeue,
-                        SceVideoOutInternalEventVblank,
-                        OrbisKernelEventFilterVideoOut,
-                        eventHint,
-                        vblankEvents[i].UserData);
-                }
-            }
-            finally
-            {
-                ArrayPool<FlipEventRegistration>.Shared.Return(vblankEvents);
-            }
-        }
-
-        if (_logVideoOutSync && (signalCount <= 8 || signalCount % 60 == 0))
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][SYNC] vblank#{signalCount} handle={port.Handle} count={port.VblankCount} " +
-                $"queues={vblankEventCount} hint=0x{eventHint:X16}");
-        }
-    }
-
     private static int SubmitFlip(
         CpuContext ctx,
         int handle,
@@ -1196,14 +939,14 @@ public static class VideoOutExports
             }
         }
 
-        var guestImageSubmitted = false;
-        ulong guestImageAddress = 0;
+        PaceFlip(port.FlipRate);
+        PerfOverlay.RecordSubmit();
+
         if (submitGpuImage &&
             bufferIndex >= 0 &&
             TryGetDisplayBufferInfo(handle, bufferIndex, out var displayBuffer))
         {
-            guestImageAddress = displayBuffer.Address;
-            guestImageSubmitted = VulkanVideoPresenter.TrySubmitGuestImage(
+            _ = VulkanVideoPresenter.TrySubmitGuestImage(
                 displayBuffer.Address,
                 displayBuffer.Width,
                 displayBuffer.Height,
@@ -1235,19 +978,7 @@ public static class VideoOutExports
             }
         }
 
-        var flipCount = Interlocked.Increment(ref _flipSubmitCount);
-        if (_logVideoOutSync && (flipCount <= 8 || flipCount % 60 == 0))
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][SYNC] flip#{flipCount} handle={handle} buffer={bufferIndex} " +
-                $"addr=0x{guestImageAddress:X16} submitted={guestImageSubmitted} " +
-                $"flipQueues={flipEventCount}");
-        }
-
-        if (_logVideoOut)
-        {
-            TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEventCount}");
-        }
+        TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEventCount}");
         ReportFrameRate(presented: false);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1283,11 +1014,140 @@ public static class VideoOutExports
         var elapsedSeconds = (double)elapsedTicks / Stopwatch.Frequency;
         var submitted = Interlocked.Exchange(ref _submittedFrameCount, 0);
         var presentedCount = Interlocked.Exchange(ref _presentedFrameCount, 0);
-        var missedEdges = Interlocked.Exchange(ref _vblankMissedEdges, 0);
+        var (draws, drawMs, pipelines, spirvCompiles) = VulkanVideoPresenter.ReadAndResetPerfCounters();
         Console.Error.WriteLine(
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
-            $"vblank_missed={missedEdges}");
+            $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles}");
+    }
+
+    private static readonly bool _flipPacingDisabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_NO_FLIP_PACING"),
+        "1",
+        StringComparison.Ordinal);
+    private static long _lastFlipPacingTimestamp;
+
+    private static Thread? _vblankThread;
+    private static readonly object _vblankThreadGate = new();
+
+    /// <summary>
+    /// Starts the emulated vblank tick once a guest registers interest in vblank
+    /// events. The tick fires the registered vblank events on their event queues
+    /// at the display refresh cadence so guests that park their main/render loop
+    /// on a vblank equeue keep advancing.
+    /// </summary>
+    private static void StartVblankThreadOnce()
+    {
+        if (Volatile.Read(ref _vblankThread) is not null)
+        {
+            return;
+        }
+
+        lock (_vblankThreadGate)
+        {
+            if (_vblankThread is not null)
+            {
+                return;
+            }
+
+            var thread = new Thread(VblankTickLoop)
+            {
+                IsBackground = true,
+                Name = "SharpEmu-Vblank",
+            };
+            _vblankThread = thread;
+            thread.Start();
+        }
+    }
+
+    private static void VblankTickLoop()
+    {
+        var pending = new List<(ulong Equeue, ulong DataHint, ulong UserData)>();
+        var next = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            uint refresh = 60;
+            pending.Clear();
+            lock (_stateGate)
+            {
+                foreach (var port in _ports.Values)
+                {
+                    if (port.VblankEvents.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    refresh = port.RefreshRate == 0 ? 60 : port.RefreshRate;
+                    port.VblankCount++;
+                    var dataHint = (port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16;
+                    foreach (var registration in port.VblankEvents)
+                    {
+                        pending.Add((registration.Equeue, dataHint, registration.UserData));
+                    }
+                }
+            }
+
+            foreach (var (equeue, dataHint, userData) in pending)
+            {
+                _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                    equeue,
+                    SceVideoOutInternalEventVblank,
+                    OrbisKernelEventFilterVideoOut,
+                    dataHint,
+                    userData);
+            }
+
+            var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
+            next += interval;
+            var now = Stopwatch.GetTimestamp();
+            if (next < now)
+            {
+                next = now;
+            }
+
+            HostTiming.SleepUntil(next);
+        }
+    }
+
+    /// <summary>
+    /// Emulates the display vblank cadence: hardware completes flips at the
+    /// requested rate, which is what paces the game's main loop. Without this
+    /// the guest runs as fast as the GPU pipeline drains, so frame delivery
+    /// is bursty and animation judders. When the emulator runs slower than
+    /// the target rate the sleep never engages.
+    /// </summary>
+    private static void PaceFlip(int flipRate)
+    {
+        if (_flipPacingDisabled)
+        {
+            return;
+        }
+
+        var refreshRate = flipRate switch
+        {
+            1 => 30,
+            2 => 20,
+            _ => 60,
+        };
+        var intervalTicks = Stopwatch.Frequency / refreshRate;
+        var now = Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _lastFlipPacingTimestamp);
+        var target = last + intervalTicks;
+        if (target <= now)
+        {
+            Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, now, last);
+            return;
+        }
+
+        var waitMilliseconds = (target - now) * 1000 / Stopwatch.Frequency;
+        if (waitMilliseconds is >= 0 and < 100)
+        {
+            // Precise wait: Thread.Sleep alone overshoots by a scheduler
+            // quantum, which caps the flip rate below the target cadence.
+            HostTiming.SleepUntil(target);
+        }
+
+        Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, target, last);
     }
 
     private static int RegisterBufferRange(VideoOutPortState port, int startIndex, ReadOnlySpan<ulong> addresses, BufferAttribute attribute, int requestedGroupIndex = -1)
@@ -1335,16 +1195,6 @@ public static class VideoOutExports
                     $"videoout.register_buffers handle={port.Handle} group={groupIndex} start={startIndex} count={addresses.Length} fmt=0x{attribute.PixelFormat:X} tile={attribute.TilingMode} {attribute.Width}x{attribute.Height} pitch={attribute.PitchInPixel}");
             }
             VulkanVideoPresenter.EnsureStarted(attribute.Width, attribute.Height);
-
-            var guestFormat = MapPixelFormatToGuestTextureFormat(attribute.PixelFormat);
-            if (guestFormat != 0)
-            {
-                foreach (var address in addresses)
-                {
-                    VulkanVideoPresenter.RegisterKnownDisplayBuffer(address, guestFormat);
-                }
-            }
-
             return groupIndex;
         }
     }
@@ -1365,9 +1215,9 @@ public static class VideoOutExports
     private static bool TryReadBufferAttribute(CpuContext ctx, ulong attributeAddress, bool attribute2, out BufferAttribute attribute)
     {
         attribute = default;
-        if (!ctx.TryReadUInt32(attributeAddress + 0x04, out var tilingMode) ||
-            !ctx.TryReadUInt32(attributeAddress + 0x0C, out var width) ||
-            !ctx.TryReadUInt32(attributeAddress + 0x10, out var height))
+        if (!TryReadUInt32(ctx, attributeAddress + 0x04, out var tilingMode) ||
+            !TryReadUInt32(ctx, attributeAddress + 0x0C, out var width) ||
+            !TryReadUInt32(ctx, attributeAddress + 0x10, out var height))
         {
             return false;
         }
@@ -1384,10 +1234,10 @@ public static class VideoOutExports
             return true;
         }
 
-        if (!ctx.TryReadUInt32(attributeAddress + 0x00, out var pixelFormat32) ||
-            !ctx.TryReadUInt32(attributeAddress + 0x08, out var aspectRatio) ||
-            !ctx.TryReadUInt32(attributeAddress + 0x14, out var pitchInPixel) ||
-            !ctx.TryReadUInt32(attributeAddress + 0x18, out var option32))
+        if (!TryReadUInt32(ctx, attributeAddress + 0x00, out var pixelFormat32) ||
+            !TryReadUInt32(ctx, attributeAddress + 0x08, out var aspectRatio) ||
+            !TryReadUInt32(ctx, attributeAddress + 0x14, out var pitchInPixel) ||
+            !TryReadUInt32(ctx, attributeAddress + 0x18, out var option32))
         {
             return false;
         }
@@ -1572,22 +1422,6 @@ public static class VideoOutExports
             ? 4u
             : 0u;
 
-    // Maps the PS5 VideoOut pixel format space to the AGC "guest texture format" tags
-    // VulkanVideoPresenter._availableGuestImages keys on (see VulkanVideoPresenter.
-    // GetGuestTextureFormat: format=10 => 56 for 8-bit RGBA variants, format=9 => 9 for 10-bit).
-    private static uint MapPixelFormatToGuestTextureFormat(ulong pixelFormat) =>
-        NormalizePixelFormat(pixelFormat) switch
-        {
-            SceVideoOutPixelFormatA8R8G8B8Srgb or
-            SceVideoOutPixelFormatA8B8G8R8Srgb or
-            SceVideoOutPixelFormatB8G8R8A8Unorm or
-            SceVideoOutPixelFormatR8G8B8A8Unorm => 56u,
-            SceVideoOutPixelFormatA2R10G10B10 or
-            SceVideoOutPixelFormatA2R10G10B10Srgb or
-            SceVideoOutPixelFormatA2R10G10B10Bt2020Pq => 9u,
-            _ => 0u,
-        };
-
     private static ulong NormalizePixelFormat(ulong pixelFormat)
     {
         if (GetBytesPerPixel(pixelFormat) != 0)
@@ -1756,6 +1590,19 @@ public static class VideoOutExports
         return true;
     }
 
+    private static bool TryReadUInt32(CpuContext ctx, ulong address, out uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+        return true;
+    }
+
     private static bool TryReadInt16(CpuContext ctx, ulong address, out short value)
     {
         Span<byte> buffer = stackalloc byte[sizeof(short)];
@@ -1769,8 +1616,26 @@ public static class VideoOutExports
         return true;
     }
 
+    private static readonly bool _logVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _traceVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _dumpVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_VIDEOOUT"),
+        "1",
+        StringComparison.Ordinal);
+
     private static void TraceVideoOut(string message)
     {
+        if (!_traceVideoOut)
+        {
+            return;
+        }
+
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
     }
 }

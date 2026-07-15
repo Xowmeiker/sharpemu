@@ -53,6 +53,19 @@ public interface IGuestThreadScheduler
 
     int WakeBlockedThreads(string wakeKey, int maxCount = int.MaxValue);
 
+    /// <summary>
+    /// Applies a new guest scheduling priority to a live thread, mapping it
+    /// onto the host thread if one is running. Returns false when the thread
+    /// handle is unknown.
+    /// </summary>
+    bool TrySetGuestThreadPriority(ulong guestThreadHandle, int guestPriority);
+
+    /// <summary>
+    /// Records a new affinity mask for a guest thread and re-applies it to
+    /// the host thread where the platform supports it.
+    /// </summary>
+    bool TrySetGuestThreadAffinity(ulong guestThreadHandle, ulong affinityMask);
+
     IReadOnlyList<GuestThreadSnapshot> SnapshotThreads();
 
     bool TryCallGuestFunction(
@@ -94,10 +107,15 @@ public readonly record struct GuestCpuContinuation(
     ulong Rdi,
     ulong R8,
     ulong R9,
+    ulong R10,
+    ulong R11,
     ulong R12,
     ulong R13,
     ulong R14,
-    ulong R15);
+    ulong R15,
+    ushort FpuControlWord,
+    uint Mxcsr,
+    bool RestoreFullFpuState);
 
 public static class GuestThreadExecution
 {
@@ -360,10 +378,15 @@ public static class GuestThreadExecution
             context[CpuRegister.Rdi],
             context[CpuRegister.R8],
             context[CpuRegister.R9],
+            context[CpuRegister.R10],
+            context[CpuRegister.R11],
             context[CpuRegister.R12],
             context[CpuRegister.R13],
             context[CpuRegister.R14],
-            context[CpuRegister.R15]);
+            context[CpuRegister.R15],
+            context.FpuControlWord,
+            context.Mxcsr,
+            RestoreFullFpuState: false);
         return true;
     }
 
