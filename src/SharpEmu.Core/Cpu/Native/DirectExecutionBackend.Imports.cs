@@ -533,6 +533,13 @@ public sealed partial class DirectExecutionBackend
 						out var transferError))
 				{
 					LastError = transferError ?? "failed to prepare guest context transfer";
+					// Surface the rejected continuation immediately: this is the
+					// diagnosable form of what used to be an opaque native crash
+					// executing a corrupt transfer target.
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest context transfer rejected after {importStubEntry.Nid}: {LastError} " +
+						$"(guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+						$"fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16})");
 					ActiveForcedGuestExit = true;
 					cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
 					return cpuContext[CpuRegister.Rax];

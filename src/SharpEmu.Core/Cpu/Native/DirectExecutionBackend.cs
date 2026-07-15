@@ -1782,8 +1782,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = $"invalid guest context transfer target rip=0x{target.Rip:X16} rsp=0x{target.Rsp:X16}";
 			return false;
 		}
+		if (ActiveCpuContext is not { } activeContext)
+		{
+			error = "guest context transfer without an active CPU context";
+			return false;
+		}
+		// The transfer stub jumps to target.Rip unconditionally, so a corrupt
+		// continuation (torn fiber context, stale return slot) would execute
+		// arbitrary host memory and kill the process with an opaque native
+		// AV. A valid target is always inside mapped guest memory; probing it
+		// here turns that crash into a diagnosable, recoverable error.
+		Span<byte> ripProbe = stackalloc byte[1];
+		if (!activeContext.Memory.TryRead(target.Rip, ripProbe))
+		{
+			error =
+				$"guest context transfer target rip=0x{target.Rip:X16} is not mapped guest memory " +
+				$"(rsp=0x{target.Rsp:X16}); refusing to jump into host address space";
+			return false;
+		}
 		if (target.Rsp < sizeof(ulong) ||
-			ActiveCpuContext is not { } activeContext ||
 			!activeContext.TryWriteUInt64(target.Rsp - sizeof(ulong), target.Rip))
 		{
 			error = $"guest context transfer slot is not writable at 0x{target.Rsp - sizeof(ulong):X16}";
