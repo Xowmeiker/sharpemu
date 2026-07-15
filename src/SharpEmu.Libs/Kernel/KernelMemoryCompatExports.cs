@@ -3308,11 +3308,20 @@ public static partial class KernelMemoryCompatExports
         {
             var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
             var fixedMapping = (flags & 0x10UL) != 0;
+            // With no requested address, place the mapping in the normal search
+            // area with a guard gap — NOT at a VA equal to the direct-memory
+            // offset and NOT flush against the previous mapping. Both placements
+            // made successive small pool mappings (Unity/Baselib allocates
+            // contiguous direct chunks) accidentally VA-contiguous, and the
+            // IL2CPP GC then coalesced them into one heap section and scanned
+            // across the shared boundary past the final chunk's end (observed
+            // as a boot-time SIGSEGV at pool_end+0x3C0).
+            const ulong anonymousMapGuardGap = 0x10000UL;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
-                : directMemoryStart != 0
-                    ? AlignUp(directMemoryStart, effectiveAlignment)
-                    : AlignUp(_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress, effectiveAlignment);
+                : AlignUp(
+                    (_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress) + anonymousMapGuardGap,
+                    effectiveAlignment);
 
             var reserved = false;
             if (fixedMapping && requestedAddress != 0)
