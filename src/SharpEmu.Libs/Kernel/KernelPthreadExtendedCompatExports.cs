@@ -40,12 +40,16 @@ public static class KernelPthreadExtendedCompatExports
         CpuContext ctx,
         ulong attrAddress,
         out int priority,
-        out ulong affinityMask)
+        out ulong affinityMask,
+        out ulong stackAddress,
+        out ulong stackSize)
     {
         if (attrAddress == 0)
         {
             priority = DefaultThreadPriority;
             affinityMask = DefaultThreadAffinityMask;
+            stackAddress = 0;
+            stackSize = 0;
             return;
         }
 
@@ -55,6 +59,26 @@ public static class KernelPthreadExtendedCompatExports
             var attributes = GetOrCreateAttrStateLocked(resolvedAddress);
             priority = attributes.SchedPriority;
             affinityMask = attributes.AffinityMask;
+            stackAddress = attributes.StackAddress;
+            stackSize = attributes.StackSize;
+        }
+    }
+
+    /// <summary>
+    /// Records the stack range a guest thread actually executes on so
+    /// scePthreadAttrGet(+Getstack*) report real, mapped bounds — the guest
+    /// GC scans them conservatively during stop-the-world.
+    /// </summary>
+    internal static void RegisterThreadStack(ulong thread, ulong stackAddress, ulong stackSize)
+    {
+        lock (_stateGate)
+        {
+            var state = GetOrCreateThreadStateLocked(thread);
+            state.Attributes = state.Attributes with
+            {
+                StackAddress = stackAddress,
+                StackSize = stackSize,
+            };
         }
     }
 

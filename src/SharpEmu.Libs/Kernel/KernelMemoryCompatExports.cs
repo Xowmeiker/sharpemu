@@ -3308,14 +3308,15 @@ public static partial class KernelMemoryCompatExports
         {
             var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
             var fixedMapping = (flags & 0x10UL) != 0;
-            // With no requested address, place the mapping in the normal search
-            // area with a guard gap — NOT at a VA equal to the direct-memory
-            // offset and NOT flush against the previous mapping. Both placements
-            // made successive small pool mappings (Unity/Baselib allocates
-            // contiguous direct chunks) accidentally VA-contiguous, and the
-            // IL2CPP GC then coalesced them into one heap section and scanned
-            // across the shared boundary past the final chunk's end (observed
-            // as a boot-time SIGSEGV at pool_end+0x3C0).
+            // The IL2CPP/Boehm GC's conservative mark loop reads a few hundred
+            // bytes past the end of the last 256 KiB pool chunk it was handed
+            // (it range-checks the loaded VALUES, not the scan address). On real
+            // hardware that stray read lands in whatever neighboring mapping
+            // exists and is harmless; an unmapped byte there is a boot SIGSEGV
+            // at pool_end+0x3C0. Back every non-fixed mapping with an extra
+            // committed guard TAIL so overrun reads return zeros (which fail the
+            // GC's plausibility bounds and are skipped). The tail is host-side
+            // backing only: _mappedRegions records the guest-visible length.
             const ulong anonymousMapGuardGap = 0x10000UL;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
@@ -3341,7 +3342,7 @@ public static partial class KernelMemoryCompatExports
             }
             else
             {
-                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, effectiveAlignment, out mappedAddress);
+                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length + anonymousMapGuardGap, protection, effectiveAlignment, out mappedAddress);
             }
             if (ShouldTraceDirectMemory())
             {
@@ -3425,9 +3426,13 @@ public static partial class KernelMemoryCompatExports
         lock (_memoryGate)
         {
             var fixedMapping = (flags & 0x10UL) != 0;
+            // Same committed guard tail as sceKernelMapDirectMemory: the
+            // conservative GC scan may read a few hundred bytes past the end of
+            // a mapping; give the read somewhere harmless (zeros) to land.
+            const ulong anonymousMapGuardGap = 0x10000UL;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
-                : AlignUp(_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress, 0x1000UL);
+                : AlignUp((_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress) + anonymousMapGuardGap, 0x1000UL);
 
             if (fixedMapping && requestedAddress != 0)
             {
@@ -3441,7 +3446,7 @@ public static partial class KernelMemoryCompatExports
                     }
                 }
             }
-            else if (!TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, OrbisPageSize, out mappedAddress))
+            else if (!TryReserveGuestVirtualRange(ctx, desiredAddress, length + anonymousMapGuardGap, protection, OrbisPageSize, out mappedAddress))
             {
                 mappedAddress = AllocateMappedGuestAddress(ctx, length, 0x1000UL);
             }

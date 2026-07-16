@@ -3603,7 +3603,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = "creator context memory is not backed by IVirtualMemory";
 			return false;
 		}
-		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackFallbackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
+		// Run the thread on the guest-provided stack (scePthreadAttrSetstack)
+		// when there is one: the guest GC conservatively scans the stack range
+		// it recorded from the creation attr, so running on a substitute stack
+		// leaves that range unwritten (and possibly only partially mapped) and
+		// the scan faults. Fall back to a scheduler-owned region otherwise.
+		ulong stackBase = 0;
+		ulong stackSize = GuestThreadStackSize;
+		if (request.StackAddress != 0 &&
+			request.StackSize >= 0x1000 &&
+			creatorContext.TryReadUInt64(request.StackAddress, out _) &&
+			creatorContext.TryReadUInt64(request.StackAddress + request.StackSize - sizeof(ulong), out _))
+		{
+			stackBase = request.StackAddress;
+			stackSize = request.StackSize;
+		}
+		else if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackFallbackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out stackBase, out error))
 		{
 			return false;
 		}
@@ -3611,6 +3626,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return false;
 		}
+
+		GuestThreadExecution.ThreadStackRegistrar?.Invoke(request.ThreadHandle, stackBase, stackSize);
 
 		var trackedMemory = new TrackedCpuMemory(virtualMemory);
 		var context = new CpuContext(trackedMemory, creatorContext.TargetGeneration)
@@ -3620,7 +3637,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			FsBase = tlsBase,
 			GsBase = tlsBase,
 		};
-		context[CpuRegister.Rsp] = stackBase + GuestThreadStackSize - sizeof(ulong);
+		context[CpuRegister.Rsp] = stackBase + stackSize - sizeof(ulong);
 		context[CpuRegister.Rdi] = request.Argument;
 		context[CpuRegister.Rsi] = 0;
 		context[CpuRegister.Rdx] = 0;
@@ -4678,6 +4695,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousEntryGuestHandle = GuestThreadExecution.EnterGuestThread(entryThreadHandle);
 				previousEntryState = _activeGuestThreadState;
 				_activeGuestThreadState = entryThread;
+				// Report a real, fully mapped stack window for the entry thread so
+				// guest-side conservative stack scans (Boehm stop-the-world) stay
+				// inside mapped memory. The entry stack region is 2 MiB; a 1 MiB
+				// window below the current top is always backed.
+				var entryStackTop = (context[CpuRegister.Rsp] & ~0xFFFUL) + 0x1000;
+				const ulong entryStackReportSize = 0x0010_0000UL;
+				GuestThreadExecution.ThreadStackRegistrar?.Invoke(
+					entryThreadHandle,
+					entryStackTop - entryStackReportSize,
+					entryStackReportSize);
 				Console.Error.WriteLine(
 					$"[LOADER][INFO] Entry thread enrolled as guest thread 0x{entryThreadHandle:X16}");
 			}

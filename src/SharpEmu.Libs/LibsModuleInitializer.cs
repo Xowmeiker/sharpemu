@@ -21,5 +21,6 @@ internal static class LibsModuleInitializer
     {
         GuestThreadExecution.CurrentThreadHandleProvider = KernelPthreadState.GetCurrentThreadHandle;
         GuestThreadExecution.ExceptionHandlerResolver = KernelExceptionCompatExports.GetInstalledHandler;
+        GuestThreadExecution.ThreadStackRegistrar = KernelPthreadExtendedCompatExports.RegisterThreadStack;
     }
 }

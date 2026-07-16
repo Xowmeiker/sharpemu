@@ -12,7 +12,9 @@ public readonly record struct GuestThreadStartRequest(
     ulong AttributeAddress,
     string Name,
     int Priority,
-    ulong AffinityMask);
+    ulong AffinityMask,
+    ulong StackAddress = 0,
+    ulong StackSize = 0);
 
 public readonly record struct GuestThreadSnapshot(
     ulong ThreadHandle,
@@ -194,6 +196,14 @@ public static class GuestThreadExecution
     /// (0 when none). Wired by SharpEmu.Libs at module initialization.
     /// </summary>
     public static Func<int, ulong>? ExceptionHandlerResolver { get; set; }
+
+    /// <summary>
+    /// Records the stack range a guest thread actually runs on
+    /// (thread handle, stack base, stack size). Wired by SharpEmu.Libs at
+    /// module initialization; keeps scePthreadAttrGet stack bounds truthful
+    /// so the guest GC's conservative stack scans cover real memory.
+    /// </summary>
+    public static Action<ulong, ulong, ulong>? ThreadStackRegistrar { get; set; }
 
     [ThreadStatic]
     private static bool _inGuestSignalHandler;

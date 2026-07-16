@@ -36,6 +36,9 @@ APP="$PUBLISH_DIR/SharpEmu"
 [ -x "$APP" ]   || { echo "SharpEmu apphost not found at: $APP (set SHARPEMU_PUBLISH_DIR=)" >&2; exit 1; }
 
 cd "$PUBLISH_DIR"
+# /app0 maps to the game dump directory (guest opens /app0/Media/... etc.).
+# Default to the eboot's own directory when not set explicitly.
+SHARPEMU_APP0_DIR="${SHARPEMU_APP0_DIR:-$(cd "$(dirname "$EBOOT")" && pwd)}"
 # SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS: Box64 gives raw pthreads whose entry is
 #   emitted x86-64 code an undersized emulated stack, so the pooled native guest
 #   workers overflow it as soon as CoreCLR JITs on that thread. The inline calli
@@ -43,6 +46,7 @@ cd "$PUBLISH_DIR"
 # DOTNET_EnableWriteXorExecute=0 / TieredCompilation=0 / big gen0: fewer runtime
 #   remaps and GC suspensions under Box64's signal handling.
 exec env \
+    SHARPEMU_APP0_DIR="$SHARPEMU_APP0_DIR" \
     DOTNET_EnableAVX2=0 \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
     DOTNET_GCHeapHardLimit=0xC0000000 \
