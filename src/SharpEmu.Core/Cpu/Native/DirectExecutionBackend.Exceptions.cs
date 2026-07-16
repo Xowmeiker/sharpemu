@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu.Disasm;
 using SharpEmu.Core.Cpu.Native.Windows;
+using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
 
@@ -127,6 +128,23 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			// Guest hardware-fault forwarding: a fault inside guest code on a
+			// guest thread is delivered to the game's installed exception
+			// handler (sceKernelInstallExceptionHandler) exactly like the
+			// Orbis kernel does — IL2CPP turns null-page reads into managed
+			// NullReferenceExceptions this way, and Boehm's marker recovers
+			// from probe reads. The handler's return traps at the sentinel
+			// RIP, where the (possibly modified) context is applied.
+			if (exceptionCode == WindowsFaultCodes.AccessViolation &&
+				rip == GuestSignalReturnSentinelRip &&
+				TryCompleteGuestFaultHandler(contextRecord))
+			{
+				return -1;
+			}
+			if (TryRedirectFaultToGuestHandler(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -1285,5 +1303,177 @@ public sealed partial class DirectExecutionBackend
 			return 64u;
 		}
 		return 4u;
+	}
+
+	// ---- Guest hardware-fault forwarding -------------------------------------
+	// Faults raised by guest code (IL2CPP null checks, conservative GC probe
+	// reads) are forwarded to the handler the game installed with
+	// sceKernelInstallExceptionHandler, mirroring the Orbis kernel. The handler
+	// runs on a pooled guest region with a synthesized FreeBSD-style ucontext;
+	// its return lands on GuestSignalReturnSentinelRip, where the possibly
+	// modified context is read back and applied to the interrupted thread.
+
+	private const ulong GuestSignalReturnSentinelRip = 0x5EC0DE00UL;
+	private const ulong GuestModuleSpaceBase = 0x0000_0008_0000_0000UL;
+	private const ulong GuestModuleSpaceEnd = 0x0000_0008_1000_0000UL;
+
+	[ThreadStatic]
+	private static Stack<ulong>? _guestFaultHandlerFrames;
+
+	private unsafe bool TryRedirectFaultToGuestHandler(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		var signum = exceptionRecord->ExceptionCode switch
+		{
+			WindowsFaultCodes.AccessViolation => 11,
+			3221225501u => 4,
+			_ => 0,
+		};
+		if (signum == 0 || rip < GuestModuleSpaceBase || rip >= GuestModuleSpaceEnd)
+		{
+			return false;
+		}
+		if (_activeGuestThreadState is null)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] guest_fault.skip sig={signum} rip=0x{rip:X16}: not a guest thread");
+			return false;
+		}
+		var handler = GuestThreadExecution.ExceptionHandlerResolver?.Invoke(signum) ?? 0;
+		if (handler == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] guest_fault.skip sig={signum} rip=0x{rip:X16}: no installed guest handler");
+			return false;
+		}
+		var frames = _guestFaultHandlerFrames ??= new Stack<ulong>();
+		if (frames.Count >= 4)
+		{
+			return false;
+		}
+		var cpuContext = ActiveCpuContext;
+		if (cpuContext is null)
+		{
+			return false;
+		}
+		if (!_signalContextRegions.TryTake(out var regionBase))
+		{
+			if (!TryGetVirtualMemory(cpuContext, out var virtualMemory) ||
+				!TryMapGuestThreadRegion(
+					virtualMemory,
+					GuestThreadStackBaseAddress,
+					GuestThreadStackFallbackBaseAddress,
+					GuestThreadStackSize,
+					ProgramHeaderFlags.Read | ProgramHeaderFlags.Write,
+					out regionBase,
+					out _))
+			{
+				return false;
+			}
+		}
+
+		var faultAddress = exceptionRecord->NumberParameters >= 2 ? exceptionRecord->ExceptionInformation[1] : 0;
+		var accessType = exceptionRecord->NumberParameters >= 1 ? *exceptionRecord->ExceptionInformation : 0;
+		if (!TryWriteGuestFaultExceptionContext(cpuContext, regionBase, contextRecord, faultAddress, accessType))
+		{
+			_signalContextRegions.Add(regionBase);
+			return false;
+		}
+
+		var handlerRsp = (regionBase + GuestThreadStackSize - 0x200) & ~0xFUL;
+		handlerRsp -= 8;
+		if (!cpuContext.TryWriteUInt64(handlerRsp, GuestSignalReturnSentinelRip))
+		{
+			_signalContextRegions.Add(regionBase);
+			return false;
+		}
+
+		frames.Push(regionBase);
+		WriteCtxU64(contextRecord, CTX_RDI, (ulong)signum);
+		WriteCtxU64(contextRecord, CTX_RSI, regionBase);
+		WriteCtxU64(contextRecord, CTX_RSP, handlerRsp);
+		WriteCtxU64(contextRecord, CTX_RIP, handler);
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] guest_fault.forward sig={signum} rip=0x{rip:X16} fault=0x{faultAddress:X16} " +
+			$"handler=0x{handler:X16} ctx=0x{regionBase:X16} depth={frames.Count}");
+		Console.Error.Flush();
+		return true;
+	}
+
+	private unsafe bool TryCompleteGuestFaultHandler(void* contextRecord)
+	{
+		var frames = _guestFaultHandlerFrames;
+		if (frames is null || frames.Count == 0)
+		{
+			return false;
+		}
+		var cpuContext = ActiveCpuContext;
+		if (cpuContext is null)
+		{
+			return false;
+		}
+
+		var contextBase = frames.Pop();
+		const ulong mc = 0x10;
+		Span<(int CtxOffset, ulong McOffset)> fields = stackalloc (int, ulong)[]
+		{
+			(CTX_RDI, 0x08), (CTX_RSI, 0x10), (CTX_RDX, 0x18), (CTX_RCX, 0x20),
+			(CTX_R8, 0x28), (CTX_R9, 0x30), (CTX_RAX, 0x38), (CTX_RBX, 0x40),
+			(CTX_RBP, 0x48), (CTX_R10, 0x50), (CTX_R11, 0x58), (CTX_R12, 0x60),
+			(CTX_R13, 0x68), (CTX_R14, 0x70), (CTX_R15, 0x78), (CTX_RIP, 0xA0),
+			(CTX_RSP, 0xB8),
+		};
+		foreach (var (ctxOffset, mcOffset) in fields)
+		{
+			if (!cpuContext.TryReadUInt64(contextBase + mc + mcOffset, out var value))
+			{
+				_signalContextRegions.Add(contextBase);
+				return false;
+			}
+			WriteCtxU64(contextRecord, ctxOffset, value);
+		}
+
+		_signalContextRegions.Add(contextBase);
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] guest_fault.return resume_rip=0x{ReadCtxU64(contextRecord, CTX_RIP):X16} " +
+			$"rsp=0x{ReadCtxU64(contextRecord, CTX_RSP):X16} depth={frames.Count}");
+		Console.Error.Flush();
+		return true;
+	}
+
+	private unsafe static bool TryWriteGuestFaultExceptionContext(
+		CpuContext cpuContext,
+		ulong contextBase,
+		void* contextRecord,
+		ulong faultAddress,
+		ulong accessType)
+	{
+		for (var offset = 0uL; offset < SignalContextFpStateOffset + 0x400uL; offset += 8)
+		{
+			if (!cpuContext.TryWriteUInt64(contextBase + offset, 0))
+			{
+				return false;
+			}
+		}
+
+		const ulong mc = 0x10;
+		Span<(ulong McOffset, int CtxOffset)> fields = stackalloc (ulong, int)[]
+		{
+			(0x08, CTX_RDI), (0x10, CTX_RSI), (0x18, CTX_RDX), (0x20, CTX_RCX),
+			(0x28, CTX_R8), (0x30, CTX_R9), (0x38, CTX_RAX), (0x40, CTX_RBX),
+			(0x48, CTX_RBP), (0x50, CTX_R10), (0x58, CTX_R11), (0x60, CTX_R12),
+			(0x68, CTX_R13), (0x70, CTX_R14), (0x78, CTX_R15), (0xA0, CTX_RIP),
+			(0xB8, CTX_RSP),
+		};
+		foreach (var (mcOffset, ctxOffset) in fields)
+		{
+			_ = cpuContext.TryWriteUInt64(contextBase + mc + mcOffset, ReadCtxU64(contextRecord, ctxOffset));
+		}
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x88, faultAddress); // mc_addr
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0x98, accessType); // mc_err
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xB0, 0x202); // mc_rflags
+		_ = cpuContext.TryWriteUInt64(contextBase + mc + 0xC8, 0x320); // mc_len
+		// Baselib-style handlers dereference ctx+0xF8 and forward it.
+		_ = cpuContext.TryWriteUInt64(contextBase + 0xF8, contextBase + SignalContextFpStateOffset);
+		return true;
 	}
 }

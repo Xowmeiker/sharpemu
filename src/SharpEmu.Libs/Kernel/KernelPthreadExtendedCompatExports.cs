@@ -64,6 +64,76 @@ public static class KernelPthreadExtendedCompatExports
         }
     }
 
+    [SysAbiExport(
+        Nid = "yDBwVAolDgg",
+        ExportName = "sceKernelIsStack",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsStack(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        var outStartPointer = ctx[CpuRegister.Rsi];
+        var outEndPointer = ctx[CpuRegister.Rdx];
+
+        ulong stackLow = 0;
+        ulong stackHigh = 0;
+        lock (_stateGate)
+        {
+            foreach (var state in _threadStates.Values)
+            {
+                var attributes = state.Attributes;
+                if (attributes.StackAddress != 0 &&
+                    attributes.StackSize != 0 &&
+                    address >= attributes.StackAddress &&
+                    address < attributes.StackAddress + attributes.StackSize)
+                {
+                    stackLow = attributes.StackAddress;
+                    stackHigh = attributes.StackAddress + attributes.StackSize;
+                    break;
+                }
+            }
+
+            if (stackLow == 0)
+            {
+                // Not inside any registered stack: report the calling thread's
+                // own stack so conservative callers (GC stack-bounds probing)
+                // still receive a real, mapped range.
+                var current = KernelPthreadState.GetCurrentThreadHandle();
+                if (current != 0 && _threadStates.TryGetValue(current, out var currentState))
+                {
+                    var attributes = currentState.Attributes;
+                    if (attributes.StackAddress != 0 && attributes.StackSize != 0)
+                    {
+                        stackLow = attributes.StackAddress;
+                        stackHigh = attributes.StackAddress + attributes.StackSize;
+                    }
+                }
+            }
+        }
+
+        if (stackLow == 0)
+        {
+            // No registered stack at all (very early boot): answer "not a
+            // stack" without touching the out-pointers rather than surfacing
+            // an SCE error the caller may misread as a positive fd/bool.
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (outStartPointer != 0 && !ctx.TryWriteUInt64(outStartPointer, stackLow))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (outEndPointer != 0 && !ctx.TryWriteUInt64(outEndPointer, stackHigh))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 1;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     /// <summary>
     /// Records the stack range a guest thread actually executes on so
     /// scePthreadAttrGet(+Getstack*) report real, mapped bounds — the guest

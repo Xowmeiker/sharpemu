@@ -1830,12 +1830,40 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    /// <summary>
+    /// Translates an SCE kernel result into the POSIX wrapper convention:
+    /// errors become RAX=-1 with errno set (guest code checks fd &lt; 0 /
+    /// ret &lt; 0, and a raw SCE code like 0x80020002 is positive when widened,
+    /// so returning it directly makes error paths look like success).
+    /// Success leaves RAX exactly as the SCE implementation set it.
+    /// </summary>
+    internal static int ToPosixFileResult(CpuContext ctx, int sceResult)
+    {
+        if (sceResult == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return 0;
+        }
+
+        var errno = sceResult switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => 13, // EACCES
+            _ => 2, // ENOENT
+        };
+        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
+        ctx[CpuRegister.Rax] = ulong.MaxValue;
+        return -1;
+    }
+
     [SysAbiExport(
         Nid = "6c3rCVE-fTU",
         ExportName = "_open",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelOpenUnderscore(CpuContext ctx)
+    public static int KernelOpenUnderscore(CpuContext ctx) => ToPosixFileResult(ctx, KernelOpenCore(ctx));
+
+    internal static int KernelOpenCore(CpuContext ctx)
     {
         var pathAddress = ctx[CpuRegister.Rdi];
         var flags = unchecked((int)ctx[CpuRegister.Rsi]);
@@ -1964,14 +1992,14 @@ public static partial class KernelMemoryCompatExports
         ExportName = "_close",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelCloseUnderscore(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+    public static int KernelCloseUnderscore(CpuContext ctx) => ToPosixFileResult(ctx, KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi])));
 
     [SysAbiExport(
         Nid = "bY-PO6JhzhQ",
         ExportName = "close",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixClose(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+    public static int PosixClose(CpuContext ctx) => ToPosixFileResult(ctx, KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi])));
 
     [SysAbiExport(
         Nid = "UK2Tl2DWUns",

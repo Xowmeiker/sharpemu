@@ -36,6 +36,8 @@ public static class KernelExceptionCompatExports
             _installedHandlers[signum] = handler;
         }
 
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] guest_exception.install sig={signum} handler=0x{handler:X16}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
